@@ -36,7 +36,7 @@ One-shot latent space transformer. No diffusion, no iterative denoising. The net
 - Produces **identical 16-channel latents** to the full Wan 2.1 VAE
 - Fully compatible — no architectural changes needed downstream
 - Used for both training (encoding + occasional pixel loss decode) and inference
-- BF16 precision throughout
+- Use 16 bit precision throughout
 - Convention note: TAEW2_1 uses pixel values in [0,1] not [-1,1], and NTCHW dimension order not NCTHW. No latent scale/shift needed unlike Diffusers convention.
 
 ### Compression ratios
@@ -108,7 +108,7 @@ One-shot latent space transformer. No diffusion, no iterative denoising. The net
   - Task is much simpler than general video generation
 - Standard multi-head self-attention, every token attends to every other token
 - Flash attention for efficiency (though 2,730 tokens is small enough it's barely needed)
-- **BF16 throughout**
+- Mixed precision - using autocast
 
 ### Output Projection
 - Linear layer: **512 → 64** dimensions
