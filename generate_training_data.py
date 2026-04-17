@@ -1,10 +1,11 @@
 # generate_training_data.py
 # Generates 25-frame training clips for the Stereo Disocclusion Infill Network.
 #
-# Each .npz sample contains:
-#   green_frames : (25, 480, 832, 3) uint8 RGB  — stereo frames, disocclusions painted green
-#   gt_frames    : (25, 480, 832, 3) uint8 RGB  — stereo frames, disocclusions filled from reference
-#   token_mask   : (7, 15, 26) bool             — per-token binary mask for network input
+# Output files per clip:
+#   <name>_gt.mp4    — stereo frames, disocclusions filled from reference (25, 480, 832, 3) uint8
+#   <name>.npz       — two arrays:
+#     token_mask : (7, 15, 26) bool   — per-token binary mask for network input
+#     hole_mask  : (25, 480, 832) bool — per-pixel hole mask for each frame
 #
 # Token grid math (TAEW2_1 + 2×2 patching):
 #   spatial  832 / (16 * 2) = 26 cols,  480 / (16 * 2) = 15 rows
@@ -554,21 +555,12 @@ def _stage3_render(in_q):
                 OUTPUT_W, OUTPUT_H, identity,
                 render_params['use_ref_as_base'], render_params['do_dilate'],
             )
-            green_frames_list.append(green_frame)
             gt_frames_list.append(gt_frame)
             hole_masks_list.append(hole_mask)
 
-        green_arr = np.stack(green_frames_list)   # (25, H, W, 3) uint8
         gt_arr    = np.stack(gt_frames_list)      # (25, H, W, 3) uint8
         masks_arr = np.stack(hole_masks_list)     # (25, H, W) bool
-
-        # ~19% of clips: replace green holes in frame 0 with blurred GT content.
-        # Simulates the inference chunk-boundary condition where the previous chunk's
-        # last output frame is fed as frame 0 of the next chunk (network output is
-        # slightly soft, not perfectly sharp like the original).
-        if render_params['blur_frame0']:
-            blurred_gt0 = cv2.GaussianBlur(gt_arr[0], (21, 21), 0)
-            green_arr[0][masks_arr[0]] = blurred_gt0[masks_arr[0]]
+        
 
         token_mask = compute_token_mask(masks_arr)   # (7, 15, 26) bool
 
@@ -582,19 +574,18 @@ def _stage3_render(in_q):
 
         out_stem = img_output_folder + name_only + f"_f{start_frame:06d}"
 
-        write_video(green_arr, out_stem + "_tmp_green.mp4", out_stem + "_green.mp4")
-        write_video(gt_arr,    out_stem + "_tmp_gt.mp4",    out_stem + "_gt.mp4")
+        write_video(gt_arr, out_stem + "_tmp_gt.mp4", out_stem + "_gt.mp4")
 
         tmp_npz   = out_stem + "_tmp.npz"
         final_npz = out_stem + ".npz"
-        np.savez_compressed(tmp_npz, token_mask=token_mask)
+        np.savez_compressed(tmp_npz, token_mask=token_mask, hole_mask=masks_arr)
         rename(tmp_npz, final_npz)
 
         with open(meta_output, "w") as f:
             f.write(f"OK ssim={ssim_val:.3f} std={std_dev:.3f} "
                     f"holes={hole_ratio:.4f} start={start_frame}")
 
-        print(f"  saved: {out_stem}_green.mp4  _gt.mp4  .npz")
+        print(f"  saved: {out_stem}_gt.mp4  .npz")
 
 
 # ---------------------------------------------------------------------------
