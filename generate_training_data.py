@@ -28,6 +28,8 @@ from skimage.metrics import structural_similarity as ssim
 from scipy.ndimage import distance_transform_edt, binary_dilation
 import random
 import re
+import threading
+import queue
 
 dataset_folder = "F:\\zip\\Moments_in_Time_Raw_v2.zip"
 training_output_folder = "training_data" + os.sep
@@ -185,12 +187,20 @@ def make_sample_for_clip(depth, img_rgb, cam_matrix, do_right,
     model = np.eye(4, dtype=np.float32)
 
     # --- Reference view render ---
-    mvp_ref = proj @ base_pos @ model
-    ref_image, ref_depth, _, ref_ids = depth_map_tools.gl_render(
-        mesh, mvp_ref, W, H, near, far, bg_color=[0.0, 0.0, 0.0])
-    ref_depth = ref_depth.copy() - delta_d
-    ref_depth[ref_ids == 0] = 0
-    ref_depth = ref_depth.clip(0, 100)
+    if not np.array_equal(transform_to_ref, np.eye(4)):
+        mvp_ref = proj @ base_pos @ model
+        ref_image, ref_depth, _, ref_ids = depth_map_tools.gl_render(
+            mesh, mvp_ref, W, H, near, far, bg_color=[0.0, 0.0, 0.0])
+        ref_depth = ref_depth.copy() - delta_d
+        ref_depth[ref_ids == 0] = 0
+        ref_depth = ref_depth.clip(0, 100)
+    else:
+        ref_image = down_scaled_org
+        ref_depth = depth
+    
+    
+    edge_mask_1_l, edge_mask_1_r = depth_map_tools.steep_disparity_lr(
+        ref_depth, cam_matrix, parallax_shift=ipd_baseline)
 
     # --- First morph: shift to stereo offset (to the virtual original iamge) ---
     vc1 = depth_map_tools.get_cam_view(center_movement, center_angle, reverse=True)
@@ -208,17 +218,41 @@ def make_sample_for_clip(depth, img_rgb, cam_matrix, do_right,
     
     edge_mask_l, edge_mask_r = depth_map_tools.steep_disparity_lr(
         gen_depth, cam_matrix, parallax_shift=ipd_baseline)
+        
+        
+    #edge_mask_l, edge_mask_r = steep_disparity_lr_v2(gen_depth, cam_matrix, parallax_shift=ipd_baseline)
+    
     if not do_right:
         edge_mask = edge_mask_r
+        edge_mask_1 = edge_mask_1_r
     else:
         edge_mask = edge_mask_l
+        edge_mask_1 = edge_mask_1_l
+    
+    # IDs that were background in first morph (edge artefacts, not true disocclusions)
+    _ids = (np.arange(H * W, dtype=np.uint32) + 1).reshape(H, W)
+    first_morph_edge_ids = _ids[edge_mask]
+    first_morph_bg_ids = _ids[background1]
+    org_edges_ids = _ids[edge_mask_1]
+    
+    # ISSUE: first_morph_ids has loots if ids that are ontop of eachother (from both inside and outside of the mask)
+    # so only a few ids from org_edges_ids is transfered to init_edges_from_first_morph and non edge
+    # We are not using isin to really detect if a pixel is in the image. But where in the image it is
+    init_edges_from_first_morph = np.isin(first_morph_ids, org_edges_ids)
+    
+    first_morph_init_edges_ids_1d = _ids[init_edges_from_first_morph]
+    
+    
+    
+    #edge_mask = depth_map_tools.steep_mask_disparity(gen_depth, cam_matrix, parallax_shift=ipd_baseline)
+    
+    #Debug make stuff green
+    #gen_img = gen_img.copy()
+    #gen_img[edge_mask] = [0.0, 1.0, 0.0]
 
     mesh_morphed, _ = depth_map_tools.mesh_from_depth_and_rgb(gen_depth, gen_img, cam_matrix)
 
-    # IDs that were background in first morph (edge artefacts, not true disocclusions)
-    first_morph_ids = (np.arange(H * W, dtype=np.uint32) + 1).reshape(H, W)
-    first_morph_edge_ids = first_morph_ids[edge_mask]
-    first_morph_bg_ids = first_morph_ids[background1]
+    
 
     # --- Second render: back to original view at 2× resolution ---
     if ipd_baseline == 0.063:
@@ -228,26 +262,47 @@ def make_sample_for_clip(depth, img_rgb, cam_matrix, do_right,
         view2 = depth_map_tools.get_cam_view(center_movement, center_angle)
     view2 = view2 @ base_pos
 
-    cam_matrix_2x = depth_map_tools.compute_camera_matrix(fovx, fovy, W * 2, H * 2)
+    cam_matrix_2x = depth_map_tools.compute_camera_matrix(fovx, fovy, W, H)
     proj_2x = depth_map_tools.open_gl_projection_from_camera_matrix(cam_matrix_2x, near, far)
 
     original_perspective_img, _, _, ids_2x = depth_map_tools.gl_render(
         mesh_morphed, proj_2x @ view2 @ model,
-        W * 2, H * 2, near, far, bg_color=[0.0, 1.0, 0.0])
+        W, H, near, far, bg_color=[0.0, 1.0, 0.0])
 
-    # background2x = true disocclusion holes (no geometry rendered here)
+    # background2x = (no geometry rendered here) ie somewhere to the side
     background2x = ids_2x == 0
+    
+    # This is pixels that we lost on the first render
     background_from_first_morph = np.isin(ids_2x, first_morph_bg_ids)
+    
+    #Edges predicted from morphed depth using steep_disparity_lr
     edges_from_first_morph = np.isin(ids_2x, first_morph_edge_ids)
+    
+    # steep_disparity_lr does not capture everything so here we also count duplicated pixels if a pixel is used
+    # more than 4 times it is very streched therefor probabkly part of a sretch area
+    ids, counts = np.unique(ids_2x, return_counts=True)
+    ids_with_2_or_more = ids[counts > 4]
+    multipixel_mask = np.isin(ids_2x, ids_with_2_or_more)
+    
+    edge_masks = edges_from_first_morph | multipixel_mask
+    
+    #edges_from_first_morph = np.isin(ids_2x, first_morph_init_edges_ids_1d)
+    
+    
+    #try first
+    #edges_from_first_morph = init_edges_from_first_morph
+    #edges_from_first_morph = edge_mask_1#np.repeat(np.repeat(edge_mask_1, 2, axis=0), 2, axis=1)
 
     # We could use the real original image as ground truth but then we would not capture any quality loss incured in rendering
     # So we use as many pixels as posible from the re render
-    org_rgb2x = cv2.resize(ref_image, (W * 2, H * 2), interpolation=cv2.INTER_AREA)
+    org_rgb2x = ref_image.copy()#cv2.resize(ref_image, (W * 2, H * 2), interpolation=cv2.INTER_AREA)
     # Ground truth: fill disocclusions AND first-morph artefacts with reference content
     degraded_ground_truth = original_perspective_img.copy()
     # Some pixels where lost in the first morph so we fill them in
+    degraded_ground_truth[background2x] = org_rgb2x[background2x]
     degraded_ground_truth[background_from_first_morph] = org_rgb2x[background_from_first_morph]
-    degraded_ground_truth = cv2.resize(degraded_ground_truth, (output_W, output_H), interpolation=cv2.INTER_AREA).astype(np.uint8)
+    degraded_ground_truth[edge_masks] = org_rgb2x[edge_masks]
+    #degraded_ground_truth = cv2.resize(degraded_ground_truth, (output_W, output_H), interpolation=cv2.INTER_AREA).astype(np.uint8)
     
     
     if use_ref_as_base:
@@ -258,7 +313,7 @@ def make_sample_for_clip(depth, img_rgb, cam_matrix, do_right,
         green_frame = degraded_ground_truth
         gt_frame = degraded_ground_truth.copy()
 
-    hole_mask2x = edges_from_first_morph
+    hole_mask2x = edge_masks
     hole_mask2x[background2x] = 1
     # Hole mask at output resolution (nearest-neighbour — holes are never single pixels)
     hole_mask_out = cv2.resize(
@@ -276,181 +331,196 @@ def make_sample_for_clip(depth, img_rgb, cam_matrix, do_right,
 
 
 # ---------------------------------------------------------------------------
-# Per-video sample generation
+# Pipeline configuration
 # ---------------------------------------------------------------------------
 
-def convert_to_training_data(video_path, from_zip=False, zip_ref=None):
-    base_name = os.path.basename(video_path)
-    name_only = os.path.splitext(base_name)[0]
+NUM_RENDER_WORKERS = 4
+_READ_QSIZE   = 4                      # frames awaiting depth   (~28 MB each)
+_RENDER_QSIZE = NUM_RENDER_WORKERS * 2 # depth results awaiting render
 
-    crc_hex = f"{zlib.crc32(name_only.encode()):08x}"
-    subfolder = crc_hex[0]
+_DONE = object()   # sentinel — each consumer re-enqueues it for siblings
 
-    img_output_folder = training_output_folder + subfolder + os.sep
-    local_cache_folder = video_cache_folder + subfolder + os.sep
-    org_video_path = local_cache_folder + clean_filename(base_name)
-    name_only = clean_filename(name_only)
 
-    meta_output = img_output_folder + name_only + '.txt'
+# ---------------------------------------------------------------------------
+# Stage 1 — Reader (zip access must stay on this thread)
+# ---------------------------------------------------------------------------
 
-    if os.path.exists(meta_output):
-        print(f"already done: {meta_output}")
-        return
+def _stage1_reader(names, from_zip, zip_ref, out_q):
+    """Decode video frames, run basic checks, push to depth queue."""
+    total = len(names)
+    for idx, video_path in enumerate(names):
+        print(f"[{idx+1}/{total}] reading {video_path}")
 
-    os.makedirs(img_output_folder, exist_ok=True)
+        base_name = os.path.basename(video_path)
+        name_only = os.path.splitext(base_name)[0]
+        crc_hex   = f"{zlib.crc32(name_only.encode()):08x}"
+        subfolder = crc_hex[0]
 
-    # Derive rendering settings from filename hash (same logic as original)
-    first_nibble  = int(crc_hex[1], 16)
-    second_nibble = int(crc_hex[2], 16)
-    third_nibble  = int(crc_hex[3], 16)
+        img_output_folder  = training_output_folder + subfolder + os.sep
+        local_cache_folder = video_cache_folder + subfolder + os.sep
+        org_video_path     = local_cache_folder + clean_filename(base_name)
+        name_only          = clean_filename(name_only)
+        meta_output        = img_output_folder + name_only + '.txt'
 
-    do_right = (first_nibble % 2 == 0)
+        if os.path.exists(meta_output):
+            print(f"  already done: {meta_output}")
+            continue
 
-    simulate_convergense = False
-    if first_nibble < 8:
-        if first_nibble < 4:
-            simulate_convergense = True
-        ipd_baseline = 0.0351   # center → left/right
-    else:
-        if first_nibble < 12:
-            simulate_convergense = True
-        ipd_baseline = 0.063    # left → right or right → left
+        os.makedirs(img_output_folder, exist_ok=True)
 
-    use_ref_as_base = (second_nibble >= 8)   # ~50 % of clips use ref render as base image
-    do_dilate       = (third_nibble  >= 8)   # ~50 % of clips get a 1-px hole dilation
+        # Derive render params from CRC
+        first_nibble  = int(crc_hex[1], 16)
+        second_nibble = int(crc_hex[2], 16)
+        third_nibble  = int(crc_hex[3], 16)
+        fourth_nibble = int(crc_hex[4], 16)
 
-    # Extract video from zip to local cache if needed
-    if from_zip:
-        if not os.path.exists(org_video_path):
-            data = zip_ref.read(video_path)
-            os.makedirs(os.path.dirname(org_video_path), exist_ok=True)
-            with open(org_video_path, 'wb') as f:
-                f.write(data)
-    else:
-        org_video_path = video_path
+        do_right = (first_nibble % 2 == 0)
+        simulate_convergense = False
+        if first_nibble < 8:
+            if first_nibble < 4:
+                simulate_convergense = True
+            ipd_baseline = 0.0351   # center → left/right
+        else:
+            if first_nibble < 12:
+                simulate_convergense = True
+            ipd_baseline = 0.063    # left → right or right → left
+        use_ref_as_base  = (second_nibble >= 8)   # ~50 % of clips use ref render as base image
+        do_dilate        = (third_nibble  >= 8)   # ~50 % of clips get a 1-px hole dilation
+        blur_frame0      = (fourth_nibble  < 2)   # ~2/16 % of clips get blurred frame-0 holes
 
-    # Check video properties
-    video = cv2.VideoCapture(org_video_path)
-    vid_w = int(video.get(cv2.CAP_PROP_FRAME_WIDTH))
-    vid_h = int(video.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = video.get(cv2.CAP_PROP_FPS)
-    video_len = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
-    print(f"  video: {vid_w}x{vid_h}  fps:{fps:.1f}  frames:{video_len}")
+        render_params = dict(
+            do_right=do_right, simulate_convergense=simulate_convergense,
+            ipd_baseline=ipd_baseline, use_ref_as_base=use_ref_as_base,
+            do_dilate=do_dilate, blur_frame0=blur_frame0,
+        )
+        meta = dict(
+            name_only=name_only,
+            img_output_folder=img_output_folder,
+            meta_output=meta_output,
+        )
 
-    def bail(msg):
+        # Extract from zip to local cache (zip_ref only touched here)
+        if from_zip:
+            if not os.path.exists(org_video_path):
+                data = zip_ref.read(video_path)
+                os.makedirs(os.path.dirname(org_video_path), exist_ok=True)
+                with open(org_video_path, 'wb') as f:
+                    f.write(data)
+            path_to_open = org_video_path
+        else:
+            path_to_open = video_path
+
+        # Read and validate frames
+        video     = cv2.VideoCapture(path_to_open)
+        vid_w     = int(video.get(cv2.CAP_PROP_FRAME_WIDTH))
+        vid_h     = int(video.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps       = video.get(cv2.CAP_PROP_FPS)
+        video_len = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+        print(f"  video: {vid_w}x{vid_h}  fps:{fps:.1f}  frames:{video_len}")
+
+        def bail(msg):
+            video.release()
+            if from_zip and os.path.exists(org_video_path):
+                os.remove(org_video_path)
+            write_report(msg, meta_output)
+
+        if max(vid_w, vid_h) < 480:
+            bail(f"resolution too low: {vid_w}x{vid_h}")
+            continue
+        if video_len < FRAMES_PER_CLIP:
+            bail(f"video too short: {video_len} frames")
+            continue
+
+        start_frame = random.randint(0, video_len - FRAMES_PER_CLIP)
+        video.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        frames_bgr = []
+        for _ in range(FRAMES_PER_CLIP):
+            ret, frame = video.read()
+            if not ret:
+                break
+            frames_bgr.append(frame)
         video.release()
+
         if from_zip and os.path.exists(org_video_path):
             os.remove(org_video_path)
-        return write_report(msg, meta_output)
 
-    if max(vid_w, vid_h) < 480:
-        return bail(f"resolution too low: {vid_w}x{vid_h}")
-    if video_len < FRAMES_PER_CLIP:
-        return bail(f"video too short: {video_len} frames")
+        if len(frames_bgr) != FRAMES_PER_CLIP:
+            write_report(f"could not read {FRAMES_PER_CLIP} frames", meta_output)
+            continue
 
-    # Read 25 consecutive frames from a random start position
-    start_frame = random.randint(0, video_len - FRAMES_PER_CLIP)
-    video.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-    frames_bgr = []
-    for _ in range(FRAMES_PER_CLIP):
-        ret, frame = video.read()
-        if not ret:
+        rgb_frames = [
+            cv2.cvtColor(cv2.resize(f, (OUTPUT_W, OUTPUT_H), interpolation=cv2.INTER_AREA),
+                         cv2.COLOR_BGR2RGB)
+            for f in frames_bgr
+        ]
+
+        out_q.put((meta, rgb_frames, render_params, start_frame))
+
+    out_q.put(_DONE)
+
+
+# ---------------------------------------------------------------------------
+# Stage 2 — Depth estimator (GPU; single thread)
+# ---------------------------------------------------------------------------
+
+def _stage2_depth(in_q, out_q):
+    """Run DA3 + UniK3D quality filter; push render-ready packages."""
+    while True:
+        item = in_q.get()
+        if item is _DONE:
             break
-        frames_bgr.append(frame)
-    video.release()
 
-    if from_zip and os.path.exists(org_video_path):
-        os.remove(org_video_path)
+        meta, rgb_frames, render_params, start_frame = item
+        meta_output = meta['meta_output']
 
-    if len(frames_bgr) != FRAMES_PER_CLIP:
-        return write_report(f"could not read {FRAMES_PER_CLIP} frames", meta_output)
+        with open(os.devnull, "w") as devnull, redirect_stdout(devnull):
+            depth_out = da3model.inference(rgb_frames, process_res=depth_resolution)
 
-    # Resize to output resolution immediately — handles any source aspect ratio
-    rgb_frames = [
-        cv2.cvtColor(cv2.resize(f, (OUTPUT_W, OUTPUT_H), interpolation=cv2.INTER_AREA),
-                     cv2.COLOR_BGR2RGB)
-        for f in frames_bgr
-    ]
+        cam_matrix = depth_out.intrinsics[0]
+        depths     = depth_out.depth.clip(0, 100)
+        H_d, W_d   = depths[0].shape
 
-    # Run depth estimation on all 25 frames
-    with open(os.devnull, "w") as devnull, redirect_stdout(devnull):
-        depth_out = da3model.inference(rgb_frames, process_res=depth_resolution)
+        std_dev = float(depths[0].std())
+        if std_dev < 0.12:
+            write_report(
+                f"depth std too low ({std_dev:.3f}) — flat scene or letterboxed", meta_output)
+            continue
 
-    cam_matrix = depth_out.intrinsics[0]
-    depths = depth_out.depth.clip(0, 100)
-    H_d, W_d = depths[0].shape
+        mid        = FRAMES_PER_CLIP // 2
+        mid_rgb    = cv2.resize(rgb_frames[mid], (W_d, H_d)).astype(np.uint8)
+        rgb_torch  = torch.from_numpy(mid_rgb).permute(2, 0, 1)
+        unik_pred  = unk3dmodel.infer(rgb_torch)
+        unik_depth = unik_pred["depth"].squeeze().cpu().numpy().clip(0, 100)
 
-    std_dev = float(depths[0].std())
-    if std_dev < 0.12:
-        return write_report(
-            f"depth std too low ({std_dev:.3f}) — flat scene or letterboxed", meta_output)
+        norm_d    = depth_frames_helper.normalize_depth(depths[mid])
+        unik_norm = depth_frames_helper.normalize_depth(unik_depth)
+        ssim_val  = float(ssim(norm_d, unik_norm, data_range=1.0))
 
-    mid = FRAMES_PER_CLIP // 2   # frame 12
+        if ssim_val < 0.72:
+            write_report(f"depth disagreement ssim={ssim_val:.3f}", meta_output)
+            continue
 
-    # Quality filter: compare DA3 and UniK3D depth on middle frame
-    mid_rgb = cv2.resize(rgb_frames[mid], (W_d, H_d)).astype(np.uint8)
-    rgb_torch = torch.from_numpy(mid_rgb).permute(2, 0, 1)
-    unik_pred = unk3dmodel.infer(rgb_torch)
-    unik_depth = unik_pred["depth"].squeeze().cpu().numpy().clip(0, 100)
+        fovx, fovy  = depth_map_tools.fov_from_camera_matrix(cam_matrix)
+        depths_proc = np.stack([
+            cv2.resize(d, (OUTPUT_W, OUTPUT_H), interpolation=cv2.INTER_AREA)
+            for d in depths
+        ])
+        proc_cam = depth_map_tools.compute_camera_matrix(fovx, fovy, OUTPUT_W, OUTPUT_H)
 
-    norm_d = depth_frames_helper.normalize_depth(depths[mid])
-    unik_norm = depth_frames_helper.normalize_depth(unik_depth)
-    ssim_val = float(ssim(norm_d, unik_norm, data_range=1.0))
+        out_q.put((meta, rgb_frames, depths_proc, proc_cam,
+                   render_params, start_frame, ssim_val, std_dev))
 
-    if ssim_val < 0.72:
-        return write_report(f"depth disagreement ssim={ssim_val:.3f}", meta_output)
+    out_q.put(_DONE)
 
-    # Interpolate depth maps to output resolution
-    fovx, fovy = depth_map_tools.fov_from_camera_matrix(cam_matrix)
-    depths_proc = np.stack([
-        cv2.resize(d, (OUTPUT_W, OUTPUT_H), interpolation=cv2.INTER_AREA)
-        for d in depths
-    ])
-    proc_cam = depth_map_tools.compute_camera_matrix(fovx, fovy, OUTPUT_W, OUTPUT_H)
 
-    # No camera stabilisation — each frame rendered from identity transform
+# ---------------------------------------------------------------------------
+# Stage 3 — Render workers (CPU-bound; N threads)
+# ---------------------------------------------------------------------------
+
+def _stage3_render(in_q):
+    """Render 25 frames per clip, apply augmentation, write outputs."""
     identity = np.eye(4, dtype=np.float32)
-
-    # Render all 25 frames
-    green_frames_list = []
-    gt_frames_list = []
-    hole_masks_list = []
-
-    for i in range(FRAMES_PER_CLIP):
-        green_frame, gt_frame, hole_mask = make_sample_for_clip(
-            depths_proc[i], rgb_frames[i], proc_cam,
-            do_right, simulate_convergense, ipd_baseline,
-            OUTPUT_W, OUTPUT_H, identity,
-            use_ref_as_base, do_dilate,
-        )
-        green_frames_list.append(green_frame)
-        gt_frames_list.append(gt_frame)
-        hole_masks_list.append(hole_mask)
-
-    green_arr = np.stack(green_frames_list)   # (25, H, W, 3) uint8
-    gt_arr    = np.stack(gt_frames_list)      # (25, H, W, 3) uint8
-    masks_arr = np.stack(hole_masks_list)     # (25, H, W) bool
-
-    # 20% of clips: replace green holes in frame 0 with blurred GT content.
-    # Simulates the inference chunk-boundary condition where the previous chunk's
-    # last output frame is fed as frame 0 of the next chunk (network output is
-    # slightly soft, not perfectly sharp like the original).
-    if random.random() < 0.20:
-        blurred_gt0 = cv2.GaussianBlur(gt_arr[0], (21, 21), 0)
-        green_arr[0][masks_arr[0]] = blurred_gt0[masks_arr[0]]
-
-    token_mask = compute_token_mask(masks_arr)   # (7, 15, 26) bool
-
-    # Skip clips with no useful holes or implausibly many (bad depth)
-    hole_ratio = float(masks_arr.mean())
-    if hole_ratio < 0.001:
-        return write_report(f"too few holes ({hole_ratio:.4f})", meta_output)
-    if hole_ratio > 0.40:
-        return write_report(f"too many holes ({hole_ratio:.4f}) — likely bad depth", meta_output)
-
-    # Write atomically via temp files
-    out_stem    = img_output_folder + name_only + f"_f{start_frame:06d}"
-    fourcc      = cv2.VideoWriter_fourcc(*"mp4v")
+    fourcc   = cv2.VideoWriter_fourcc(*"mp4v")
 
     def write_video(frames_rgb, tmp_path, final_path):
         writer = cv2.VideoWriter(tmp_path, fourcc, 25.0, (OUTPUT_W, OUTPUT_H))
@@ -459,21 +529,113 @@ def convert_to_training_data(video_path, from_zip=False, zip_ref=None):
         writer.release()
         rename(tmp_path, final_path)
 
-    write_video(green_arr, out_stem + "_tmp_green.mp4", out_stem + "_green.mp4")
-    write_video(gt_arr,    out_stem + "_tmp_gt.mp4",    out_stem + "_gt.mp4")
+    while True:
+        item = in_q.get()
+        if item is _DONE:
+            in_q.put(_DONE)   # pass sentinel on to sibling workers
+            break
 
-    # .npz — token mask only
-    tmp_npz   = out_stem + "_tmp.npz"
-    final_npz = out_stem + ".npz"
-    np.savez_compressed(tmp_npz, token_mask=token_mask)
-    rename(tmp_npz, final_npz)
+        (meta, rgb_frames, depths_proc, proc_cam,
+         render_params, start_frame, ssim_val, std_dev) = item
 
-    with open(meta_output, "w") as f:
-        f.write(f"OK ssim={ssim_val:.3f} std={std_dev:.3f} "
-                f"holes={hole_ratio:.4f} start={start_frame}")
+        name_only         = meta['name_only']
+        img_output_folder = meta['img_output_folder']
+        meta_output       = meta['meta_output']
 
-    print(f"  saved: {out_stem}_green.mp4  _gt.mp4  .npz")
-    return True
+        green_frames_list = []
+        gt_frames_list    = []
+        hole_masks_list   = []
+
+        for i in range(FRAMES_PER_CLIP):
+            green_frame, gt_frame, hole_mask = make_sample_for_clip(
+                depths_proc[i], rgb_frames[i], proc_cam,
+                render_params['do_right'], render_params['simulate_convergense'],
+                render_params['ipd_baseline'],
+                OUTPUT_W, OUTPUT_H, identity,
+                render_params['use_ref_as_base'], render_params['do_dilate'],
+            )
+            green_frames_list.append(green_frame)
+            gt_frames_list.append(gt_frame)
+            hole_masks_list.append(hole_mask)
+
+        green_arr = np.stack(green_frames_list)   # (25, H, W, 3) uint8
+        gt_arr    = np.stack(gt_frames_list)      # (25, H, W, 3) uint8
+        masks_arr = np.stack(hole_masks_list)     # (25, H, W) bool
+
+        # ~19% of clips: replace green holes in frame 0 with blurred GT content.
+        # Simulates the inference chunk-boundary condition where the previous chunk's
+        # last output frame is fed as frame 0 of the next chunk (network output is
+        # slightly soft, not perfectly sharp like the original).
+        if render_params['blur_frame0']:
+            blurred_gt0 = cv2.GaussianBlur(gt_arr[0], (21, 21), 0)
+            green_arr[0][masks_arr[0]] = blurred_gt0[masks_arr[0]]
+
+        token_mask = compute_token_mask(masks_arr)   # (7, 15, 26) bool
+
+        hole_ratio = float(masks_arr.mean())
+        if hole_ratio < 0.001:
+            write_report(f"too few holes ({hole_ratio:.4f})", meta_output)
+            continue
+        if hole_ratio > 0.40:
+            write_report(f"too many holes ({hole_ratio:.4f}) — likely bad depth", meta_output)
+            continue
+
+        out_stem = img_output_folder + name_only + f"_f{start_frame:06d}"
+
+        write_video(green_arr, out_stem + "_tmp_green.mp4", out_stem + "_green.mp4")
+        write_video(gt_arr,    out_stem + "_tmp_gt.mp4",    out_stem + "_gt.mp4")
+
+        tmp_npz   = out_stem + "_tmp.npz"
+        final_npz = out_stem + ".npz"
+        np.savez_compressed(tmp_npz, token_mask=token_mask)
+        rename(tmp_npz, final_npz)
+
+        with open(meta_output, "w") as f:
+            f.write(f"OK ssim={ssim_val:.3f} std={std_dev:.3f} "
+                    f"holes={hole_ratio:.4f} start={start_frame}")
+
+        print(f"  saved: {out_stem}_green.mp4  _gt.mp4  .npz")
+
+
+# ---------------------------------------------------------------------------
+# Pipeline runner
+# ---------------------------------------------------------------------------
+
+def _run_pipeline(names, from_zip, zip_ref):
+    read_q   = queue.Queue(maxsize=_READ_QSIZE)
+    render_q = queue.Queue(maxsize=_RENDER_QSIZE)
+
+    reader = threading.Thread(
+        target=_stage1_reader,
+        args=(names, from_zip, zip_ref, read_q),
+        name="reader", daemon=True,
+    )
+    depth_t = threading.Thread(
+        target=_stage2_depth,
+        args=(read_q, render_q),
+        name="depth", daemon=True,
+    )
+    renderers = [
+        threading.Thread(
+            target=_stage3_render,
+            args=(render_q,),
+            name=f"render-{i}", daemon=True,
+        )
+        for i in range(NUM_RENDER_WORKERS)
+    ]
+
+    reader.start()
+    depth_t.start()
+    for r in renderers:
+        r.start()
+
+    all_threads = [reader, depth_t] + renderers
+    try:
+        for t in all_threads:
+            while t.is_alive():
+                t.join(timeout=0.5)
+    except KeyboardInterrupt:
+        print("\nInterrupted — daemon threads will exit with the process.")
 
 
 # ---------------------------------------------------------------------------
@@ -495,9 +657,7 @@ def process_dataset_folder(dataset_path):
             random.seed(42)
             random.shuffle(names)
             print(f"Found {len(names)} videos")
-            for idx, name in enumerate(names):
-                print(f"[{idx+1}/{len(names)}] {name}")
-                convert_to_training_data(name, from_zip=True, zip_ref=z)
+            _run_pipeline(names, from_zip=True, zip_ref=z)
         return
 
     if os.path.isdir(dataset_path):
@@ -510,9 +670,7 @@ def process_dataset_folder(dataset_path):
         random.seed(42)
         random.shuffle(paths)
         print(f"Found {len(paths)} videos")
-        for idx, p in enumerate(paths):
-            print(f"[{idx+1}/{len(paths)}] {p}")
-            convert_to_training_data(p)
+        _run_pipeline(paths, from_zip=False, zip_ref=None)
         return
 
     print("ERROR: dataset_path is neither a folder nor a .zip file.")
