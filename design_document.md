@@ -40,9 +40,9 @@ One-shot latent space transformer. No diffusion, no iterative denoising. The net
 - Convention note: TAEW2_1 uses pixel values in [0,1] not [-1,1], and NTCHW dimension order not NCTHW. No latent scale/shift needed unlike Diffusers convention.
 
 ### Compression ratios
-- Spatial: **16×** (832→52, 480→30)
+- Spatial: **8×** (832→104, 480→60)
 - Temporal: **4×**
-- Latent volume for 25 frames: **7 × 52 × 30 × 16**
+- Latent volume for 25 frames: **7 × 16 × 60 × 104**
 
 ---
 
@@ -50,15 +50,15 @@ One-shot latent space transformer. No diffusion, no iterative denoising. The net
 
 ### Frames
 - **25 input frames** at 832×480 with green painted disocclusion regions
-- Encoded to **7 × 52 × 30 × 16** latents via TAEW2_1
+- Encoded to **7 × 16 × 60 × 104** latents via TAEW2_1
 - 25 frames chosen because temporal compression gives 1 + (24/4) = 7 latents — clean alignment with the 4× temporal compression (valid frame counts follow 1 + 4n pattern: 1, 5, 9, 17, 25...)
 
 ### Network Input
-- 7 latent volume: **7 × 52 × 30 × 16**
+- 7 latent volume: **7 × 16 × 60 × 104**
 - Plus binary mask flags (described in tokenization)
 
 ### Network Output
-- 7 latent volume: **7 × 52 × 30 × 16**
+- 7 latent volume: **7 × 16 × 60 × 104**
 - Decoded back to 25 frames via TAEW2_1
 
 ---
@@ -66,18 +66,18 @@ One-shot latent space transformer. No diffusion, no iterative denoising. The net
 ## Tokenization
 
 ### Spatial Patching
-- **2×2 spatial patches** on the latent volume — same as Wan's own patchification step
-- Each patch covers 4 latent positions × 16 channels = **64 values**
+- **4×4 spatial patches** on the latent volume
+- Each patch covers 16 latent positions × 16 channels = **256 values**
 - Total tokens: 7 × 26 × 15 = **2,730 tokens**
-- 4× fewer tokens than 1×1 patching → ~16× faster attention
+- 16× fewer tokens than 1×1 patching → ~256× faster attention
 
 ### Binary Mask Flag
-- Each token gets **+1 binary value** indicating whether any pixel in its 2×2 patch area was painted green
+- Each token gets **+1 binary value** indicating whether any pixel in its 4×4 patch area was painted green
 - Computed trivially before encoding from the known mask
 - Disambiguates mask green from genuine green scene content (forest, cars, traffic lights etc.)
 - The flag handles "am I a masked token?" globally and reliably
-- The latent values themselves handle "where exactly within my 2×2 patch is the green?" locally
-- Final token size: **65 values** (64 latent + 1 flag)
+- The latent values themselves handle "where exactly within my 4×4 patch is the green?" locally
+- Final token size: **257 values** (256 latent + 1 flag)
 
 ---
 
@@ -91,7 +91,7 @@ One-shot latent space transformer. No diffusion, no iterative denoising. The net
 - More expressive than convolutions for context propagation across thin disocclusion strips
 
 ### Input Projection
-- Linear layer: **65 → 1024** dimensions
+- Linear layer: **257 → 1024** dimensions
 - Expands each token into a rich representational space for the transformer to work in
 - The projection matrix learns arbitrary combinations of all 65 input values
 
@@ -128,11 +128,11 @@ One-shot latent space transformer. No diffusion, no iterative denoising. The net
 - Flash attention for both local and global attention passes
 
 ### Output Projection
-- Linear layer: **1024 → 64** dimensions
+- Linear layer: **1024 → 256** dimensions
 - Projects back down from transformer hidden space to patch values
 
 ### Reshape
-- Unpatch: **2,730 × 64 → 7 × 52 × 30 × 16**
+- Unpatch: **2,730 × 256 → 7 × 16 × 60 × 104**
 - This is the predicted filled latent volume
 
 ---
@@ -184,12 +184,12 @@ Shift weight from latent L1 toward GAN loss as training progresses for sharper r
 1. Take input stereo frame sequence (25 frames)
 2. Paint disocclusion regions green
 3. Compute binary mask flags for each 2×2 latent patch
-4. Encode frames through TAEW2_1 → **7 × 52 × 30 × 16**
-5. Tokenize: reshape + 2×2 patch → **2,730 × 65**
-6. Project up: **2,730 × 65 → 2,730 × 1024**
+4. Encode frames through TAEW2_1 → **7 × 16 × 60 × 104**
+5. Tokenize: reshape + 4×4 patch → **2,730 × 257**
+6. Project up: **2,730 × 257 → 2,730 × 1024**
 7. Run through transformer layers
-8. Project down: **2,730 × 1024 → 2,730 × 64**
-9. Unpatch + reshape → **7 × 52 × 30 × 16**
+8. Project down: **2,730 × 1024 → 2,730 × 256**
+9. Unpatch + reshape → **7 × 16 × 60 × 104**
 10. Decode through TAEW2_1 → **25 frames** with disocclusions filled
 11. Composite output pixels back onto input using the original mask — real pixels from input, filled pixels from network output
 
@@ -206,8 +206,8 @@ Shift weight from latent L1 toward GAN loss as training progresses for sharper r
 | Temporal window | 25 frames / 7 latents | Enough temporal context for consistency, manageable VRAM |
 | Mask encoding | Green pixels | Full resolution, sharp boundaries, consistent latent signature |
 | Mask disambiguation | Binary flag per token | Separates mask green from genuine scene green cheaply |
-| Patching | 2×2 spatial | 16× attention speedup, same as Wan's own approach |
-| Token size | 65 (64 latent + 1 flag) | Natural grouping of channels, flag added for mask disambiguation |
+| Patching | 4×4 spatial | 256× attention speedup vs 1×1 |
+| Token size | 257 (256 latent + 1 flag) | Natural grouping of channels, flag added for mask disambiguation |
 | Hidden dim | 1024 | Standard middle ground for model capacity |
 | Depth | 10 layers | Task is simpler than general video generation |
 | Attention | Sparse (local all tokens, global green only) | ~100× cheaper global attention, mask flag defines sparsity for free |
