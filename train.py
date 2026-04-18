@@ -6,6 +6,36 @@ import random
 import torch
 from torch.utils.data import DataLoader
 
+
+# ---------------------------------------------------------------------------
+# GPU memory helpers
+# ---------------------------------------------------------------------------
+
+def _mb(bytes_val):
+    return bytes_val / (1024 ** 2)
+
+
+def _mem_snapshot(label, snapshots, device):
+    """Record current and peak allocated VRAM at this checkpoint."""
+    if device.type != "cuda":
+        return
+    cur  = torch.cuda.memory_allocated(device)
+    peak = torch.cuda.max_memory_allocated(device)
+    snapshots.append((label, _mb(cur), _mb(peak)))
+
+
+def _print_mem_breakdown(snapshots, baseline_mb):
+    """Print a table of memory snapshots from one training step."""
+    print("\n  --- GPU memory breakdown (MB) ---")
+    print(f"  {'stage':<30} {'current':>8}  {'peak':>8}  {'delta':>8}")
+    print(f"  {'-'*30}  {'-'*8}  {'-'*8}  {'-'*8}")
+    prev = baseline_mb
+    for label, cur, peak in snapshots:
+        delta = cur - prev
+        print(f"  {label:<30} {cur:8.1f}  {peak:8.1f}  {delta:+8.1f}")
+        prev = cur
+    print()
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "taehv"))
 from taehv import TAEHV
 
@@ -116,23 +146,26 @@ def latent_l1_outside(pred, target, token_mask):
     return (pred - target).abs()[mask].mean()
 
 
-def pixel_l1_outside(vae, pred_latents, gt_pixels, hole_mask, device):
+def pixel_loss_grad(vae, pred_latents, gt_pixels, hole_mask, device):
     """
-    Pixel L1 outside holes — catches shifts that look small in latent space
-    but are visible after the non-linear VAE decode.
+    Compute pixel L1 loss (outside holes) and its gradient w.r.t. pred_latents.
 
-    pred_latents : (B, 7, 16, 60, 104) bfloat16
-    gt_pixels    : (B, 25, 3, H, W)    float32 [0,1]
-    hole_mask    : (B, 25, H, W)        bool
+    Uses a detached proxy so the VAE computation graph is completely separate
+    from the network graph. The proxy graph is freed after .backward(), so the
+    only persistent memory cost is the gradient tensor (~3 MB), not 25 frames
+    of VAE activations.
+
+    Returns (loss_value: float, grad: Tensor same shape/dtype as pred_latents).
     """
+    proxy = pred_latents.detach().requires_grad_(True)
     pred_pixels = vae.decode_video(
-        pred_latents.to(torch.float16),
-        parallel=True, show_progress_bar=False,
-    )   # (B, 25, 3, H, W) float16
-
+        proxy.to(torch.float16), parallel=False, show_progress_bar=False,
+    )
     outside = ~hole_mask.to(device)
     outside = outside.unsqueeze(2).expand_as(pred_pixels)
-    return (pred_pixels.float() - gt_pixels.to(device).float()).abs()[outside].mean()
+    loss = LAMBDA_PIXEL_OUT * (pred_pixels.float() - gt_pixels.to(device).float()).abs()[outside].mean()
+    loss.backward()   # backprops only through VAE proxy graph, then frees it
+    return loss.item(), proxy.grad.to(pred_latents.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +292,13 @@ def train(
 
     net.train()
     disc.train()
+
+    # Memory baseline: models loaded, before any batch work
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    baseline_mb = _mb(torch.cuda.memory_allocated(device)) if device.type == "cuda" else 0
+    print(f"VRAM after model load: {baseline_mb:.1f} MB")
+
     done = False
     while not done:
         for batch in loader:
@@ -266,13 +306,42 @@ def train(
                 done = True
                 break
 
-            with torch.no_grad():
-                input_latents = encode(vae, batch["input"], device)
-                gt_latents    = encode(vae, batch["gt"],    device)
+            profile_this_step = (step == 0)   # full breakdown on first step only
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(device)
+            mem = []
 
-            token_mask   = batch["token_mask"].to(device)
+            with torch.no_grad():
+                _mem_snapshot("batch on CPU", mem, device)
+                input_latents = encode(vae, batch["input"], device)
+                _mem_snapshot("after encode input", mem, device)
+                gt_latents    = encode(vae, batch["gt"],    device)
+                _mem_snapshot("after encode gt", mem, device)
+
+            token_mask = batch["token_mask"].to(device)
+
+            # --- Pixel loss (computed before main forward to avoid memory overlap) ---
+            # No-grad forward gives pred_latents with no network graph → VAE proxy graph
+            # is the only heavy allocation, peaks ~19 GB then fully frees before main forward.
+            # all this to make sure we never use more than 24Gb memory
+            pix_loss_val = None
+            pix_grad     = None
+            if random.random() < PIXEL_LOSS_PROB:
+                with torch.no_grad():
+                    pred_lat_ng = net(input_latents.to(torch.bfloat16), token_mask)
+                pix_loss_val, pix_grad = pixel_loss_grad(
+                    vae, pred_lat_ng, batch["gt"], batch["hole_mask"], device)
+                _mem_snapshot("after pixel decode (pre-forward)", mem, device)
+                del pred_lat_ng
+
+            # --- Main forward (network activations held for backward) ---
             pred_latents = net(input_latents.to(torch.bfloat16), token_mask)
-            gt_bf16      = gt_latents.to(torch.bfloat16)
+            _mem_snapshot("after net forward", mem, device)
+            gt_bf16 = gt_latents.to(torch.bfloat16)
+
+            # Inject pre-computed pixel gradient into the main backward via hook
+            if pix_grad is not None:
+                pred_latents.register_hook(lambda g, pg=pix_grad: g + pg)
 
             mask_flat   = token_mask.reshape(token_mask.shape[0], -1)
             pred_tokens = patchify(pred_latents).detach()   # detached for D update
@@ -288,6 +357,7 @@ def train(
                 d_loss = d_hinge(real_scores, fake_scores)
                 disc_optimizer.zero_grad()
                 d_loss.backward()
+                _mem_snapshot("after D backward", mem, device)
                 torch.nn.utils.clip_grad_norm_(disc.parameters(), GRAD_CLIP_NORM)
                 disc_optimizer.step()
                 disc_scheduler.step()
@@ -300,13 +370,6 @@ def train(
             loss_out = LAMBDA_LATENT_OUT * latent_l1_outside(pred_latents, gt_bf16, token_mask)
             loss     = loss_in + loss_out
 
-            pix_loss_val = None
-            if random.random() < PIXEL_LOSS_PROB:
-                pix = LAMBDA_PIXEL_OUT * pixel_l1_outside(
-                    vae, pred_latents, batch["gt"], batch["hole_mask"], device)
-                loss = loss + pix
-                pix_loss_val = pix.item()
-
             g_loss_val = None
             if step >= GAN_START_STEP:
                 g_loss = lam_gan * g_hinge(disc(pred_tokens_g, mask_flat))
@@ -315,6 +378,7 @@ def train(
 
             optimizer.zero_grad()
             loss.backward()
+            _mem_snapshot("after G backward", mem, device)
             torch.nn.utils.clip_grad_norm_(net.parameters(), GRAD_CLIP_NORM)
             optimizer.step()
             scheduler.step()
@@ -322,8 +386,24 @@ def train(
             step += 1
             current_lr = scheduler.get_last_lr()[0]
 
+            # Peak VRAM this step
+            peak_mb = _mb(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else 0
+
             log_step(step, loss.item(), loss_in.item(), loss_out.item(),
                      pix_loss_val, d_loss_val, g_loss_val, current_lr, lam_in, lam_gan)
+
+            if profile_this_step:
+                _print_mem_breakdown(mem, baseline_mb)
+                B = input_latents.shape[0]
+                print(f"  --- Tensor sizes (batch={B}) ---")
+                def _sz(t): return f"{t.shape}  {_mb(t.nbytes):.1f} MB"
+                print(f"  input pixels   : {_sz(batch['input'])}")
+                print(f"  gt pixels      : {_sz(batch['gt'])}")
+                print(f"  input latents  : {_sz(input_latents)}")
+                print(f"  gt latents     : {_sz(gt_latents)}")
+                print(f"  token_mask     : {_sz(token_mask)}")
+                print(f"  pred_latents   : {_sz(pred_latents)}")
+                print()
 
             pix_str = f" pix {pix_loss_val:.4f}" if pix_loss_val is not None else ""
             gan_str = (f" | D {d_loss_val:.4f} G {g_loss_val:.4f}"
@@ -331,7 +411,8 @@ def train(
             print(f"step {step:6d} | loss {loss.item():.4f} "
                   f"(in {loss_in.item():.4f} out {loss_out.item():.4f}{pix_str}){gan_str} | "
                   f"lr {current_lr:.2e} lam_in {lam_in:.2f} lam_gan {lam_gan:.2f} | "
-                  f"masked {token_mask.sum().item()}")
+                  f"masked {token_mask.sum().item()} | "
+                  f"VRAM peak {peak_mb:.0f} MB")
 
             if step % SAVE_EVERY == 0:
                 save_checkpoint(net, optimizer, scheduler, disc, disc_optimizer, disc_scheduler, step)
