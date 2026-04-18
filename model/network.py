@@ -86,16 +86,16 @@ class Pos3D(nn.Module):
 # Local 3×3×3 attention
 # ---------------------------------------------------------------------------
 
-def _gather_neighbors(x):
+def _gather_neighbors(kv):
     """
     For each token, collect its 3×3×3 spatiotemporal neighborhood.
 
-    x       : (B, N, D)  tokens arranged in TOKEN_T × TOKEN_H × TOKEN_W order
-    Returns : (B, N, 27, D)
+    kv      : (B, N, 2D)  K and V concatenated, tokens in TOKEN_T×TOKEN_H×TOKEN_W order
+    Returns : (B, N, 27, 2D)
     """
-    B, N, D = x.shape
+    B, N, D2 = kv.shape
     pad = LOCAL_K // 2
-    x3d = x.reshape(B, TOKEN_T, TOKEN_H, TOKEN_W, D).permute(0, 4, 1, 2, 3)
+    x3d = kv.reshape(B, TOKEN_T, TOKEN_H, TOKEN_W, D2).permute(0, 4, 1, 2, 3)
     x3d = F.pad(x3d, (pad, pad, pad, pad, pad, pad))   # pad W, H, T
 
     slices = []
@@ -103,10 +103,10 @@ def _gather_neighbors(x):
         for dh in range(LOCAL_K):
             for dw in range(LOCAL_K):
                 slices.append(x3d[:, :, dt:dt+TOKEN_T, dh:dh+TOKEN_H, dw:dw+TOKEN_W])
-    # stack → (B, D, 27, T, H, W) → (B, N, 27, D)
+    # stack → (B, 2D, 27, T, H, W) → (B, N, 27, 2D)
     return (torch.stack(slices, dim=2)
             .permute(0, 3, 4, 5, 2, 1)
-            .reshape(B, N, LOCAL_K**3, D))
+            .reshape(B, N, LOCAL_K**3, D2))
 
 
 class LocalAttention(nn.Module):
@@ -121,20 +121,20 @@ class LocalAttention(nn.Module):
 
     def forward(self, x):
         B, N, D = x.shape
+        H, d = self.n_heads, self.head_dim
         q, k, v = self.qkv(x).chunk(3, dim=-1)   # each (B, N, D)
 
-        k_nb = _gather_neighbors(k)   # (B, N, 27, D)
-        v_nb = _gather_neighbors(v)
+        # Gather K and V neighbors in a single pass
+        kv_nb = _gather_neighbors(torch.cat([k, v], dim=-1))   # (B, N, 27, 2D)
+        k_nb, v_nb = kv_nb.chunk(2, dim=-1)                    # each (B, N, 27, D)
 
-        H, d = self.n_heads, self.head_dim
-        q    = q.reshape(B, N, H, d)
-        k_nb = k_nb.reshape(B, N, 27, H, d)
-        v_nb = v_nb.reshape(B, N, 27, H, d)
+        # Reshape for sdpa: (B*N, H, seq, d)
+        q    = q.reshape(B * N, 1, H, d).transpose(1, 2)       # (B*N, H, 1, d)
+        k_nb = k_nb.reshape(B * N, 27, H, d).transpose(1, 2)   # (B*N, H, 27, d)
+        v_nb = v_nb.reshape(B * N, 27, H, d).transpose(1, 2)
 
-        scale = d ** -0.5
-        attn = torch.einsum("bnhd,bnkhd->bnhk", q, k_nb).mul_(scale).softmax(-1)
-        out  = torch.einsum("bnhk,bnkhd->bnhd", attn, v_nb).reshape(B, N, D)
-        return self.out_proj(out)
+        out = F.scaled_dot_product_attention(q, k_nb, v_nb)    # (B*N, H, 1, d)
+        return self.out_proj(out.transpose(1, 2).reshape(B, N, D))
 
 
 # ---------------------------------------------------------------------------
@@ -143,17 +143,16 @@ class LocalAttention(nn.Module):
 
 class GlobalAttention(nn.Module):
     """
-    Masked tokens attend to every token in the sequence.
-    Non-masked tokens are skipped entirely — output is zero for them.
-    The residual connection in SparseTransformerLayer keeps them unchanged.
+    Full self-attention, results applied only to masked token positions.
+    Non-masked token outputs are zeroed — the residual keeps them unchanged.
+    Fully batched via sdpa; no Python loop over batch items.
     """
 
     def __init__(self, hidden, n_heads):
         super().__init__()
         self.n_heads  = n_heads
         self.head_dim = hidden // n_heads
-        self.q_proj   = nn.Linear(hidden, hidden, bias=False)
-        self.kv_proj  = nn.Linear(hidden, 2 * hidden, bias=False)
+        self.qkv      = nn.Linear(hidden, 3 * hidden, bias=False)
         self.out_proj = nn.Linear(hidden, hidden, bias=False)
 
     def forward(self, x, mask_flat):
@@ -165,25 +164,16 @@ class GlobalAttention(nn.Module):
         B, N, D = x.shape
         H, d = self.n_heads, self.head_dim
 
-        k, v = self.kv_proj(x).chunk(2, dim=-1)
-        k = k.reshape(B, N, H, d).permute(0, 2, 1, 3)   # (B, H, N, d)
+        q, k, v = self.qkv(x).chunk(3, dim=-1)
+        q = q.reshape(B, N, H, d).permute(0, 2, 1, 3)   # (B, H, N, d)
+        k = k.reshape(B, N, H, d).permute(0, 2, 1, 3)
         v = v.reshape(B, N, H, d).permute(0, 2, 1, 3)
 
-        out   = torch.zeros_like(x)
-        scale = d ** -0.5
+        out = F.scaled_dot_product_attention(q, k, v)    # (B, H, N, d)
+        out = self.out_proj(out.permute(0, 2, 1, 3).reshape(B, N, D))
 
-        for b in range(B):
-            mask = mask_flat[b]
-            if not mask.any():
-                continue
-            q = self.q_proj(x[b, mask])                           # (M, D)
-            M = q.shape[0]
-            q = q.reshape(M, H, d).permute(1, 0, 2)              # (H, M, d)
-            attn = torch.einsum("hmd,hnd->hmn", q, k[b]).mul_(scale).softmax(-1)
-            res  = torch.einsum("hmn,hnd->hmd", attn, v[b])      # (H, M, d)
-            out[b, mask] = self.out_proj(res.permute(1, 0, 2).reshape(M, D))
-
-        return out
+        # Zero out non-masked positions; residual connection preserves their values
+        return out * mask_flat.unsqueeze(-1)
 
 
 # ---------------------------------------------------------------------------
