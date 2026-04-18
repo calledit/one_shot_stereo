@@ -247,6 +247,20 @@ class OneShotStereoNet(nn.Module):
         ])
         self.norm        = nn.LayerNorm(HIDDEN)
         self.output_proj = nn.Linear(HIDDEN, TOKEN_DIM)
+        self._init_weights()
+
+    def _init_weights(self):
+        # Standard transformer init; output_proj zeroed so the network starts
+        # as an identity map (input latents pass through unchanged).
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.trunc_normal_(m.weight, std=0.02, a=-0.04, b=0.04)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Embedding):
+                nn.init.trunc_normal_(m.weight, std=0.02, a=-0.04, b=0.04)
+        nn.init.zeros_(self.output_proj.weight)
+        nn.init.zeros_(self.output_proj.bias)
 
     def forward(self, latents, token_mask):
         """
@@ -265,5 +279,5 @@ class OneShotStereoNet(nn.Module):
         for layer in self.layers:
             x = layer(x, mask_flat)
 
-        x = self.output_proj(self.norm(x))   # (B, 2730, 256)
-        return unpatchify(x)                  # (B, 7, 16, 60, 104)
+        delta = self.output_proj(self.norm(x))   # (B, 2730, 256)
+        return unpatchify(tokens + delta)         # residual on input latents

@@ -236,8 +236,12 @@ def train(
 
     net  = OneShotStereoNet().to(device, torch.bfloat16)
     disc = LatentDiscriminator().to(device, torch.bfloat16)
-    optimizer      = torch.optim.AdamW(net.parameters(),  lr=lr)
-    disc_optimizer = torch.optim.AdamW(disc.parameters(), lr=lr)
+    optimizer      = torch.optim.AdamW(
+        net.parameters(),  lr=lr, betas=(0.9, 0.95), weight_decay=0.01,
+    )
+    disc_optimizer = torch.optim.AdamW(
+        disc.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=0.01,
+    )
     scheduler      = make_scheduler(optimizer)
     disc_scheduler = make_scheduler(disc_optimizer)
     print(f"Network parameters:       {sum(p.numel() for p in net.parameters())/1e6:.1f}M")
@@ -340,8 +344,7 @@ def train(
 if __name__ == "__main__":
     train(
         batch_size=2,
-        num_workers=2,
+        num_workers=1,
         lr=1e-4,
         device_str="cuda" if torch.cuda.is_available() else "cpu",
-        max_steps=1,
     )
