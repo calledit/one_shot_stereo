@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "taehv"))
 from taehv import TAEHV
 
-from dataset import (
+from data.dataset import (
     StereoDisocclusionDataset, collate_fn,
     TRAINING_DATA_ROOT,
     LATENT_T, LATENT_C, LATENT_H, LATENT_W,

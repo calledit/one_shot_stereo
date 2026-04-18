@@ -19,7 +19,7 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "taehv"))
 from taehv import TAEHV
 
-from dataset import (
+from data.dataset import (
     compute_token_mask,
     FRAMES_PER_CLIP, OUTPUT_H, OUTPUT_W,
     LATENT_T, LATENT_C, LATENT_H, LATENT_W,

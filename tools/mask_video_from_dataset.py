@@ -10,11 +10,13 @@ Usage:
 """
 
 import os
+import sys
 import argparse
 import numpy as np
 import cv2
 
-from dataset import FRAMES_PER_CLIP, OUTPUT_W, OUTPUT_H
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from data.dataset import FRAMES_PER_CLIP, OUTPUT_W, OUTPUT_H
 
 
 def load_clip(npz_path, window):
