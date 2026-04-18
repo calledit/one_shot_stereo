@@ -64,7 +64,7 @@ GRAD_CLIP_NORM  = 1.0
 # Loss weights — static
 LAMBDA_LATENT_OUT = 0.1   # latent L1 outside holes (cheap, every step)
 LAMBDA_PIXEL_OUT  = 1.0   # pixel L1 outside holes
-PIXEL_LOSS_PROB   = 0.1   # probability of computing pixel loss each step
+PIXEL_LOSS_PROB   = 0.05   # probability of computing pixel loss each step
 
 # Loss weights — dynamic (shift from L1 toward GAN as training progresses)
 GAN_START_STEP        = 10_000

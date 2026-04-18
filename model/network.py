@@ -18,6 +18,7 @@ Forward pass:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from data.dataset import (
     TOKEN_T, TOKEN_H, TOKEN_W, TOKEN_DIM, PATCH_SIZE,
@@ -277,7 +278,7 @@ class OneShotStereoNet(nn.Module):
         x      = x + self.pos_enc().to(dtype=x.dtype, device=x.device)
 
         for layer in self.layers:
-            x = layer(x, mask_flat)
+            x = checkpoint(layer, x, mask_flat, use_reentrant=False)
 
         delta = self.output_proj(self.norm(x))   # (B, 2730, 256)
         return unpatchify(tokens + delta)         # residual on input latents
