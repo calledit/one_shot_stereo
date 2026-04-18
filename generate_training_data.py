@@ -3,9 +3,7 @@
 #
 # Output files per clip:
 #   <name>_gt.mp4    — stereo frames, disocclusions filled from reference (25, 480, 832, 3) uint8
-#   <name>.npz       — two arrays:
-#     token_mask : (7, 15, 26) bool   — per-token binary mask for network input
-#     hole_mask  : (25, 480, 832) bool — per-pixel hole mask for each frame
+#   <name>.npz       — hole_mask : (N, 480, 832) bool  N=25 or 50
 #
 # Token grid math (TAEW2_1 + 2×2 patching):
 #   spatial  832 / (16 * 2) = 26 cols,  480 / (16 * 2) = 15 rows
@@ -41,7 +39,8 @@ MODEL_maxOUTPUT_depth = 100.0
 
 OUTPUT_W = 832
 OUTPUT_H = 480
-FRAMES_PER_CLIP = 25
+FRAMES_PER_CLIP      = 25
+FRAMES_PER_LONG_CLIP = 50   # used when video is long enough; training samples 25 out of 50
 
 # Token-level mask dimensions
 TOKEN_T = 7    # temporal latents: (25-1)/4 + 1
@@ -432,10 +431,11 @@ def _stage1_reader(names, from_zip, zip_ref, out_q):
             bail(f"video too short: {video_len} frames")
             continue
 
-        start_frame = random.randint(0, video_len - FRAMES_PER_CLIP)
+        clip_len    = FRAMES_PER_LONG_CLIP if video_len >= FRAMES_PER_LONG_CLIP else FRAMES_PER_CLIP
+        start_frame = random.randint(0, video_len - clip_len)
         video.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
         frames_bgr = []
-        for _ in range(FRAMES_PER_CLIP):
+        for _ in range(clip_len):
             ret, frame = video.read()
             if not ret:
                 break
@@ -445,8 +445,8 @@ def _stage1_reader(names, from_zip, zip_ref, out_q):
         if from_zip and os.path.exists(org_video_path):
             os.remove(org_video_path)
 
-        if len(frames_bgr) != FRAMES_PER_CLIP:
-            write_report(f"could not read {FRAMES_PER_CLIP} frames", meta_output)
+        if len(frames_bgr) != clip_len:
+            write_report(f"could not read {clip_len} frames", meta_output)
             continue
 
         rgb_frames = [
@@ -455,7 +455,7 @@ def _stage1_reader(names, from_zip, zip_ref, out_q):
             for f in frames_bgr
         ]
 
-        out_q.put((meta, rgb_frames, render_params, start_frame))
+        out_q.put((meta, rgb_frames, render_params, start_frame, clip_len))
 
     out_q.put(_DONE)
 
@@ -471,9 +471,23 @@ def _stage2_depth(in_q, out_q):
         if item is _DONE:
             break
 
-        meta, rgb_frames, render_params, start_frame = item
+        meta, rgb_frames, render_params, start_frame, clip_len = item
         meta_output = meta['meta_output']
+        mid = clip_len // 2
 
+        # --- Fast UniK3D check on middle frame (skip DA3 if scene is flat) ---
+        rgb_torch  = torch.from_numpy(rgb_frames[mid]).permute(2, 0, 1)
+        unik_pred  = unk3dmodel.infer(rgb_torch)
+        unik_depth = unik_pred["depth"].squeeze().cpu().numpy().clip(0, 100)
+        unik_norm  = depth_frames_helper.normalize_depth(unik_depth)
+
+        std_dev = float(unik_norm.std())
+        if std_dev < 0.12:
+            write_report(
+                f"depth std too low ({std_dev:.3f}) — flat scene or letterboxed", meta_output)
+            continue
+
+        # --- Heavy DA3 on all frames ---
         with open(os.devnull, "w") as devnull, redirect_stdout(devnull):
             depth_out = da3model.inference(rgb_frames, process_res=depth_resolution)
 
@@ -481,23 +495,11 @@ def _stage2_depth(in_q, out_q):
         depths     = depth_out.depth.clip(0, 100)
         H_d, W_d   = depths[0].shape
 
-        std_dev = float(depths[0].std())
-        if std_dev < 0.12:
-            write_report(
-                f"depth std too low ({std_dev:.3f}) — flat scene or letterboxed", meta_output)
-            continue
+        norm_d            = depth_frames_helper.normalize_depth(depths[mid])
+        unik_norm_resized = cv2.resize(unik_norm, (W_d, H_d), interpolation=cv2.INTER_AREA)
+        ssim_val          = float(ssim(norm_d, unik_norm_resized, data_range=1.0))
 
-        mid        = FRAMES_PER_CLIP // 2
-        mid_rgb    = cv2.resize(rgb_frames[mid], (W_d, H_d)).astype(np.uint8)
-        rgb_torch  = torch.from_numpy(mid_rgb).permute(2, 0, 1)
-        unik_pred  = unk3dmodel.infer(rgb_torch)
-        unik_depth = unik_pred["depth"].squeeze().cpu().numpy().clip(0, 100)
-
-        norm_d    = depth_frames_helper.normalize_depth(depths[mid])
-        unik_norm = depth_frames_helper.normalize_depth(unik_depth)
-        ssim_val  = float(ssim(norm_d, unik_norm, data_range=1.0))
-
-        if ssim_val < 0.72:
+        if ssim_val < 0.6:
             write_report(f"depth disagreement ssim={ssim_val:.3f}", meta_output)
             continue
 
@@ -509,7 +511,7 @@ def _stage2_depth(in_q, out_q):
         proc_cam = depth_map_tools.compute_camera_matrix(fovx, fovy, OUTPUT_W, OUTPUT_H)
 
         out_q.put((meta, rgb_frames, depths_proc, proc_cam,
-                   render_params, start_frame, ssim_val, std_dev))
+                   render_params, start_frame, clip_len, ssim_val, std_dev))
 
     out_q.put(_DONE)
 
@@ -537,17 +539,16 @@ def _stage3_render(in_q):
             break
 
         (meta, rgb_frames, depths_proc, proc_cam,
-         render_params, start_frame, ssim_val, std_dev) = item
+         render_params, start_frame, clip_len, ssim_val, std_dev) = item
 
         name_only         = meta['name_only']
         img_output_folder = meta['img_output_folder']
         meta_output       = meta['meta_output']
 
-        green_frames_list = []
-        gt_frames_list    = []
-        hole_masks_list   = []
+        gt_frames_list  = []
+        hole_masks_list = []
 
-        for i in range(FRAMES_PER_CLIP):
+        for i in range(clip_len):
             green_frame, gt_frame, hole_mask = make_sample_for_clip(
                 depths_proc[i], rgb_frames[i], proc_cam,
                 render_params['do_right'], render_params['simulate_convergense'],
@@ -558,11 +559,9 @@ def _stage3_render(in_q):
             gt_frames_list.append(gt_frame)
             hole_masks_list.append(hole_mask)
 
-        gt_arr    = np.stack(gt_frames_list)      # (25, H, W, 3) uint8
-        masks_arr = np.stack(hole_masks_list)     # (25, H, W) bool
-        
+        gt_arr    = np.stack(gt_frames_list)   # (clip_len, H, W, 3) uint8
+        masks_arr = np.stack(hole_masks_list)  # (clip_len, H, W) bool
 
-        token_mask = compute_token_mask(masks_arr)   # (7, 15, 26) bool
 
         hole_ratio = float(masks_arr.mean())
         if hole_ratio < 0.001:
@@ -578,7 +577,7 @@ def _stage3_render(in_q):
 
         tmp_npz   = out_stem + "_tmp.npz"
         final_npz = out_stem + ".npz"
-        np.savez_compressed(tmp_npz, token_mask=token_mask, hole_mask=masks_arr)
+        np.savez_compressed(tmp_npz, hole_mask=masks_arr)
         rename(tmp_npz, final_npz)
 
         with open(meta_output, "w") as f:
