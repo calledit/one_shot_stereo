@@ -91,7 +91,7 @@ One-shot latent space transformer. No diffusion, no iterative denoising. The net
 - More expressive than convolutions for context propagation across thin disocclusion strips
 
 ### Input Projection
-- Linear layer: **65 → 512** dimensions
+- Linear layer: **65 → 1024** dimensions
 - Expands each token into a rich representational space for the transformer to work in
 - The projection matrix learns arbitrary combinations of all 65 input values
 
@@ -101,17 +101,34 @@ One-shot latent space transformer. No diffusion, no iterative denoising. The net
 - Sinusoidal or learned — either works, learned may be slightly better for this domain
 
 ### Transformer Layers
-- **6–12 layers** of self-attention + FFN
+- **10 layers** of self-attention + FFN if more is required we add more layers
 - Shallower than Wan (which needs depth for novel content generation) because:
   - Green detection is trivial and local
   - Fill content is strongly constrained by surrounding pixels
   - Task is much simpler than general video generation
-- Standard multi-head self-attention, every token attends to every other token
-- Flash attention for efficiency (though 2,730 tokens is small enough it's barely needed)
-- Mixed precision - using autocast
+- **Sparse attention** with two levels per layer:
+
+**Local attention — all tokens**
+- Every token attends to its immediate spatial and temporal neighbors
+- Small fixed window — 3×3×3 in token space
+- Handles texture continuity and ensures non-green tokens stay stable
+- Cheap — fixed cost regardless of sequence length
+
+**Global attention — green (masked) tokens only**
+- Only tokens with mask flag = 1 perform full global attention
+- Green tokens can attend to any of the 2,730 tokens in the sequence
+- This is where fill content is pulled from distant but relevant regions in space and time
+- Non-green tokens never perform global attention — they don't need it
+
+**Why sparse attention works here**
+- Disocclusion regions are typically 5-10% of the frame
+- So only ~5-10% of tokens (~136-273) ever do global attention
+- Global attention cost: ~273² instead of 2,730² = ~100× cheaper
+- The mask flag already computed at tokenization time defines the sparsity pattern — no additional computation needed to determine which tokens go global
+- Flash attention for both local and global attention passes
 
 ### Output Projection
-- Linear layer: **512 → 64** dimensions
+- Linear layer: **1024 → 64** dimensions
 - Projects back down from transformer hidden space to patch values
 
 ### Reshape
@@ -169,9 +186,9 @@ Shift weight from latent L1 toward GAN loss as training progresses for sharper r
 3. Compute binary mask flags for each 2×2 latent patch
 4. Encode frames through TAEW2_1 → **7 × 52 × 30 × 16**
 5. Tokenize: reshape + 2×2 patch → **2,730 × 65**
-6. Project up: **2,730 × 65 → 2,730 × 512**
+6. Project up: **2,730 × 65 → 2,730 × 1024**
 7. Run through transformer layers
-8. Project down: **2,730 × 512 → 2,730 × 64**
+8. Project down: **2,730 × 1024 → 2,730 × 64**
 9. Unpatch + reshape → **7 × 52 × 30 × 16**
 10. Decode through TAEW2_1 → **25 frames** with disocclusions filled
 11. Composite output pixels back onto input using the original mask — real pixels from input, filled pixels from network output
@@ -191,9 +208,51 @@ Shift weight from latent L1 toward GAN loss as training progresses for sharper r
 | Mask disambiguation | Binary flag per token | Separates mask green from genuine scene green cheaply |
 | Patching | 2×2 spatial | 16× attention speedup, same as Wan's own approach |
 | Token size | 65 (64 latent + 1 flag) | Natural grouping of channels, flag added for mask disambiguation |
-| Hidden dim | 512 | Standard middle ground for model capacity |
-| Depth | 6-12 layers | Task is simpler than general video generation |
+| Hidden dim | 1024 | Standard middle ground for model capacity |
+| Depth | 10 layers | Task is simpler than general video generation |
+| Attention | Sparse (local all tokens, global green only) | ~100× cheaper global attention, mask flag defines sparsity for free |
 | Precision | BF16 | Speed and memory efficiency |
 | Latent loss | L1 inside holes | Cheap, every step, broad correctness |
 | Pixel loss | L1 outside holes | Ensures pixel alignment, run occasionally |
 | Perceptual/sharpness | Latent GAN | Can't do VGG features without decoding, GAN stays in latent space |
+
+
+
+## Training Data
+
+### File layout
+
+All clips live under training_data/ split into 16 subfolders (0–f) based on the first hex digit of the video
+filename's CRC32. Each processed video produces three files:
+
+training_data/<hex>/
+  <name>_f<NNNNNN>_gt.mp4   — ground-truth video
+  <name>_f<NNNNNN>.npz      — hole mask
+  <name>_f<NNNNNN>.txt      — status line (OK or rejection reason)
+
+<NNNNNN> is the zero-padded start frame index within the source video.
+
+---
+### Ground-truth video (_gt.mp4)
+
+- Resolution: 832 × 480 RGB
+- 25 frames (source video < 50 frames) or 50 frames (source video ≥ 50 frames)
+- Content: the stereo-shifted frame with disocclusion holes filled in from the reference view. This is what the
+network must learn to output.
+The 50 frames clips can be used for data augmenation you can use it to generate three 25 frame samples. Start, middle, end.
+
+---
+### Hole mask (.npz)
+
+Single array hole_mask, shape (N, 480, 832) bool, where N matches the frame count of the paired video (25 or 50).
+
+True = this pixel is a disocclusion hole in this frame.
+
+---
+## Use of traning data
+
+To use the traning data use the hole mask to paint the ground truth frames green where needed. Also create token masks.
+In 10% of the clip the first frame will have the hole filed with blured ground truth in it instead of green.
+So we can give the last frame as the first to achive temporal consistency between chunks when doing inference.
+
+The data can also be augmented by reversing it in time or fliping the frames left-right.
