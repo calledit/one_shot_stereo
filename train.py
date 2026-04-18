@@ -4,6 +4,7 @@ import sys
 import glob
 import random
 import torch
+from torch.utils.checkpoint import checkpoint as grad_ckpt
 from torch.utils.data import DataLoader
 
 
@@ -158,8 +159,10 @@ def pixel_loss_grad(vae, pred_latents, gt_pixels, hole_mask, device):
     Returns (loss_value: float, grad: Tensor same shape/dtype as pred_latents).
     """
     proxy = pred_latents.detach().requires_grad_(True)
-    pred_pixels = vae.decode_video(
-        proxy.to(torch.float16), parallel=False, show_progress_bar=False,
+    pred_pixels = grad_ckpt(
+        lambda p: vae.decode_video(p, parallel=False, show_progress_bar=False),
+        proxy.to(torch.float16),
+        use_reentrant=False,
     )
     outside = ~hole_mask.to(device)
     outside = outside.unsqueeze(2).expand_as(pred_pixels)
@@ -235,9 +238,15 @@ def _prune_checkpoints():
 # Training loop
 # ---------------------------------------------------------------------------
 
+def _infinite(loader):
+    while True:
+        yield from loader
+
+
 def train(
     data_root=TRAINING_DATA_ROOT,
     batch_size=4,
+    pixel_batch_size=2,
     num_workers=2,
     lr=1e-4,
     device_str="cuda",
@@ -251,15 +260,22 @@ def train(
         root=data_root, augment=False,
         subfolders=StereoDisocclusionDataset.VAL_SUBFOLDERS,
     )
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        collate_fn=collate_fn,
-        pin_memory=(device.type == "cuda"),
-        drop_last=True,
-    )
+
+    def _make_loader(bs):
+        return DataLoader(
+            dataset,
+            batch_size=bs,
+            shuffle=True,
+            num_workers=num_workers,
+            collate_fn=collate_fn,
+            pin_memory=(device.type == "cuda"),
+            drop_last=True,
+        )
+
+    loader       = _make_loader(batch_size)
+    pixel_loader = _make_loader(pixel_batch_size)
+    loader_iter       = _infinite(loader)
+    pixel_loader_iter = _infinite(pixel_loader)
 
     print(f"Loading VAE from {VAE_CHECKPOINT} ...")
     vae = load_vae(device)
@@ -301,121 +317,126 @@ def train(
 
     done = False
     while not done:
-        for batch in loader:
-            if max_steps is not None and step >= max_steps:
-                done = True
-                break
+        if max_steps is not None and step >= max_steps:
+            break
 
-            profile_this_step = (step == 0)   # full breakdown on first step only
-            if device.type == "cuda":
-                torch.cuda.reset_peak_memory_stats(device)
-            mem = []
+        do_pixel = random.random() < PIXEL_LOSS_PROB
+        batch = next(pixel_loader_iter if do_pixel else loader_iter)
 
+        if max_steps is not None and step >= max_steps:
+            done = True
+            break
+
+        profile_this_step = (step == 0)   # full breakdown on first step only
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+        mem = []
+
+        with torch.no_grad():
+            _mem_snapshot("batch on CPU", mem, device)
+            input_latents = encode(vae, batch["input"], device)
+            _mem_snapshot("after encode input", mem, device)
+            gt_latents    = encode(vae, batch["gt"],    device)
+            _mem_snapshot("after encode gt", mem, device)
+
+        token_mask = batch["token_mask"].to(device)
+
+        # --- Pixel loss (computed before main forward to avoid memory overlap) ---
+        # No-grad forward gives pred_latents with no network graph → VAE proxy graph
+        # is the only heavy allocation, peaks ~19 GB then fully frees before main forward.
+        # all this to make sure we never use more than 24Gb memory
+        pix_loss_val = None
+        pix_grad     = None
+        if do_pixel:
             with torch.no_grad():
-                _mem_snapshot("batch on CPU", mem, device)
-                input_latents = encode(vae, batch["input"], device)
-                _mem_snapshot("after encode input", mem, device)
-                gt_latents    = encode(vae, batch["gt"],    device)
-                _mem_snapshot("after encode gt", mem, device)
+                pred_lat_ng = net(input_latents.to(torch.bfloat16), token_mask)
+            pix_loss_val, pix_grad = pixel_loss_grad(
+                vae, pred_lat_ng, batch["gt"], batch["hole_mask"], device)
+            _mem_snapshot("after pixel decode (pre-forward)", mem, device)
+            del pred_lat_ng
 
-            token_mask = batch["token_mask"].to(device)
+        # --- Main forward (network activations held for backward) ---
+        pred_latents = net(input_latents.to(torch.bfloat16), token_mask)
+        _mem_snapshot("after net forward", mem, device)
+        gt_bf16 = gt_latents.to(torch.bfloat16)
 
-            # --- Pixel loss (computed before main forward to avoid memory overlap) ---
-            # No-grad forward gives pred_latents with no network graph → VAE proxy graph
-            # is the only heavy allocation, peaks ~19 GB then fully frees before main forward.
-            # all this to make sure we never use more than 24Gb memory
-            pix_loss_val = None
-            pix_grad     = None
-            if random.random() < PIXEL_LOSS_PROB:
-                with torch.no_grad():
-                    pred_lat_ng = net(input_latents.to(torch.bfloat16), token_mask)
-                pix_loss_val, pix_grad = pixel_loss_grad(
-                    vae, pred_lat_ng, batch["gt"], batch["hole_mask"], device)
-                _mem_snapshot("after pixel decode (pre-forward)", mem, device)
-                del pred_lat_ng
+        # Inject pre-computed pixel gradient into the main backward via hook
+        if pix_grad is not None:
+            pred_latents.register_hook(lambda g, pg=pix_grad: g + pg)
 
-            # --- Main forward (network activations held for backward) ---
-            pred_latents = net(input_latents.to(torch.bfloat16), token_mask)
-            _mem_snapshot("after net forward", mem, device)
-            gt_bf16 = gt_latents.to(torch.bfloat16)
+        mask_flat   = token_mask.reshape(token_mask.shape[0], -1)
+        pred_tokens = patchify(pred_latents).detach()   # detached for D update
+        gt_tokens   = patchify(gt_bf16)
 
-            # Inject pre-computed pixel gradient into the main backward via hook
-            if pix_grad is not None:
-                pred_latents.register_hook(lambda g, pg=pix_grad: g + pg)
+        lam_in, lam_gan = get_loss_weights(step)
 
-            mask_flat   = token_mask.reshape(token_mask.shape[0], -1)
-            pred_tokens = patchify(pred_latents).detach()   # detached for D update
-            gt_tokens   = patchify(gt_bf16)
+        # --- Discriminator update (only after GAN_START_STEP) ---
+        d_loss_val = None
+        if step >= GAN_START_STEP:
+            real_scores = disc(gt_tokens,   mask_flat)
+            fake_scores = disc(pred_tokens, mask_flat)
+            d_loss = d_hinge(real_scores, fake_scores)
+            disc_optimizer.zero_grad()
+            d_loss.backward()
+            _mem_snapshot("after D backward", mem, device)
+            torch.nn.utils.clip_grad_norm_(disc.parameters(), GRAD_CLIP_NORM)
+            disc_optimizer.step()
+            disc_scheduler.step()
+            d_loss_val = d_loss.item()
 
-            lam_in, lam_gan = get_loss_weights(step)
+        # --- Generator update ---
+        pred_tokens_g = patchify(pred_latents)   # not detached — gradients flow to net
 
-            # --- Discriminator update (only after GAN_START_STEP) ---
-            d_loss_val = None
-            if step >= GAN_START_STEP:
-                real_scores = disc(gt_tokens,   mask_flat)
-                fake_scores = disc(pred_tokens, mask_flat)
-                d_loss = d_hinge(real_scores, fake_scores)
-                disc_optimizer.zero_grad()
-                d_loss.backward()
-                _mem_snapshot("after D backward", mem, device)
-                torch.nn.utils.clip_grad_norm_(disc.parameters(), GRAD_CLIP_NORM)
-                disc_optimizer.step()
-                disc_scheduler.step()
-                d_loss_val = d_loss.item()
+        loss_in  = lam_in            * latent_l1_inside(pred_latents,  gt_bf16, token_mask)
+        loss_out = LAMBDA_LATENT_OUT * latent_l1_outside(pred_latents, gt_bf16, token_mask)
+        loss     = loss_in + loss_out
 
-            # --- Generator update ---
-            pred_tokens_g = patchify(pred_latents)   # not detached — gradients flow to net
+        g_loss_val = None
+        if step >= GAN_START_STEP:
+            g_loss = lam_gan * g_hinge(disc(pred_tokens_g, mask_flat))
+            loss = loss + g_loss
+            g_loss_val = g_loss.item()
 
-            loss_in  = lam_in            * latent_l1_inside(pred_latents,  gt_bf16, token_mask)
-            loss_out = LAMBDA_LATENT_OUT * latent_l1_outside(pred_latents, gt_bf16, token_mask)
-            loss     = loss_in + loss_out
+        optimizer.zero_grad()
+        loss.backward()
+        _mem_snapshot("after G backward", mem, device)
+        torch.nn.utils.clip_grad_norm_(net.parameters(), GRAD_CLIP_NORM)
+        optimizer.step()
+        scheduler.step()
 
-            g_loss_val = None
-            if step >= GAN_START_STEP:
-                g_loss = lam_gan * g_hinge(disc(pred_tokens_g, mask_flat))
-                loss = loss + g_loss
-                g_loss_val = g_loss.item()
+        step += 1
+        current_lr = scheduler.get_last_lr()[0]
 
-            optimizer.zero_grad()
-            loss.backward()
-            _mem_snapshot("after G backward", mem, device)
-            torch.nn.utils.clip_grad_norm_(net.parameters(), GRAD_CLIP_NORM)
-            optimizer.step()
-            scheduler.step()
+        # Peak VRAM this step
+        peak_mb = _mb(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else 0
 
-            step += 1
-            current_lr = scheduler.get_last_lr()[0]
+        log_step(step, loss.item(), loss_in.item(), loss_out.item(),
+                 pix_loss_val, d_loss_val, g_loss_val, current_lr, lam_in, lam_gan)
 
-            # Peak VRAM this step
-            peak_mb = _mb(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else 0
+        if profile_this_step:
+            _print_mem_breakdown(mem, baseline_mb)
+            B = input_latents.shape[0]
+            print(f"  --- Tensor sizes (batch={B}) ---")
+            def _sz(t): return f"{t.shape}  {_mb(t.nbytes):.1f} MB"
+            print(f"  input pixels   : {_sz(batch['input'])}")
+            print(f"  gt pixels      : {_sz(batch['gt'])}")
+            print(f"  input latents  : {_sz(input_latents)}")
+            print(f"  gt latents     : {_sz(gt_latents)}")
+            print(f"  token_mask     : {_sz(token_mask)}")
+            print(f"  pred_latents   : {_sz(pred_latents)}")
+            print()
 
-            log_step(step, loss.item(), loss_in.item(), loss_out.item(),
-                     pix_loss_val, d_loss_val, g_loss_val, current_lr, lam_in, lam_gan)
+        pix_str = f" pix {pix_loss_val:.4f}" if pix_loss_val is not None else ""
+        gan_str = (f" | D {d_loss_val:.4f} G {g_loss_val:.4f}"
+                   if g_loss_val is not None else "")
+        print(f"step {step:6d} | loss {loss.item():.4f} "
+              f"(in {loss_in.item():.4f} out {loss_out.item():.4f}{pix_str}){gan_str} | "
+              f"lr {current_lr:.2e} lam_in {lam_in:.2f} lam_gan {lam_gan:.2f} | "
+              f"masked {token_mask.sum().item()} | "
+              f"VRAM peak {peak_mb:.0f} MB")
 
-            if profile_this_step:
-                _print_mem_breakdown(mem, baseline_mb)
-                B = input_latents.shape[0]
-                print(f"  --- Tensor sizes (batch={B}) ---")
-                def _sz(t): return f"{t.shape}  {_mb(t.nbytes):.1f} MB"
-                print(f"  input pixels   : {_sz(batch['input'])}")
-                print(f"  gt pixels      : {_sz(batch['gt'])}")
-                print(f"  input latents  : {_sz(input_latents)}")
-                print(f"  gt latents     : {_sz(gt_latents)}")
-                print(f"  token_mask     : {_sz(token_mask)}")
-                print(f"  pred_latents   : {_sz(pred_latents)}")
-                print()
-
-            pix_str = f" pix {pix_loss_val:.4f}" if pix_loss_val is not None else ""
-            gan_str = (f" | D {d_loss_val:.4f} G {g_loss_val:.4f}"
-                       if g_loss_val is not None else "")
-            print(f"step {step:6d} | loss {loss.item():.4f} "
-                  f"(in {loss_in.item():.4f} out {loss_out.item():.4f}{pix_str}){gan_str} | "
-                  f"lr {current_lr:.2e} lam_in {lam_in:.2f} lam_gan {lam_gan:.2f} | "
-                  f"masked {token_mask.sum().item()} | "
-                  f"VRAM peak {peak_mb:.0f} MB")
-
-            if step % SAVE_EVERY == 0:
-                save_checkpoint(net, optimizer, scheduler, disc, disc_optimizer, disc_scheduler, step)
+        if step % SAVE_EVERY == 0:
+            save_checkpoint(net, optimizer, scheduler, disc, disc_optimizer, disc_scheduler, step)
 
     # Always save at end of run
     save_checkpoint(net, optimizer, scheduler, disc, disc_optimizer, disc_scheduler, step)
@@ -424,8 +445,9 @@ def train(
 
 if __name__ == "__main__":
     train(
-        batch_size=2,
-        num_workers=1,
+        batch_size=4,
+        pixel_batch_size=2,
+        num_workers=2,
         lr=1e-4,
         device_str="cuda" if torch.cuda.is_available() else "cpu",
     )
