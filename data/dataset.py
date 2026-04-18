@@ -66,14 +66,19 @@ class StereoDisocclusionDataset(Dataset):
         <name>_f<N>_gt.mp4 — ground-truth video, N=25 or 50 frames
     """
 
-    def __init__(self, root=TRAINING_DATA_ROOT, augment=True):
-        self.augment = augment
-        self.clips = self._scan(root)
-        print(f"Found {len(self.clips)} valid clips under {root}")
+    TRAIN_SUBFOLDERS = "0123456789abcde"
+    VAL_SUBFOLDERS   = "f"
 
-    def _scan(self, root):
+    def __init__(self, root=TRAINING_DATA_ROOT, augment=True, subfolders=None):
+        self.augment = augment
+        if subfolders is None:
+            subfolders = self.TRAIN_SUBFOLDERS
+        self.clips = self._scan(root, subfolders)
+        print(f"Found {len(self.clips)} valid clips under {root} (subfolders: {subfolders!r})")
+
+    def _scan(self, root, subfolders):
         clips = []
-        for subfolder in "0123456789abcdef":
+        for subfolder in subfolders:
             folder = os.path.join(root, subfolder)
             if not os.path.isdir(folder):
                 continue

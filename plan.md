@@ -1,27 +1,41 @@
 # One Shot Stereo — Plan
 
-## 1. ~~Attention efficiency~~
-Implemented
-The local attention `_gather_neighbors` creates large intermediate tensors `(B, N, 27, D)`.
-The global attention uses a Python loop over batch items.
-Both should use `F.scaled_dot_product_attention` (PyTorch flash attention) for speed and memory.
+## Status
 
-## 2. ~~Pixel L1 loss (outside holes)~~
-Implemented: latent L1 outside holes every step (0.1×) plus pixel L1 outside holes
-every ~10th step via gradient-checkpointed VAE decode (1.0×).
+Data loading, augmentation, VAE integration, network skeleton, discriminator, loss functions,
+checkpointing, and training loop scaffolding are all in place.
 
-## 3. ~~GAN loss (discriminator in latent space)~~
-Implemented
-A discriminator operating on the 2730-token latent representation. Pushes fill quality beyond
-what L1 alone achieves. Needs adversarial training loop with a separate optimizer.
+---
 
-## 4. Loss scheduling
-Dynamic λ weights that shift from latent L1 toward GAN loss as training progresses.
+## Remaining work
 
-## 5. Training quality-of-life
-Gradient clipping, LR warmup + decay, loss logging to file.
+### 1. Fix training loop exhaustion (`train.py`)
+The `for batch in loader:` only iterates one epoch then stops. Wrap in an infinite loop so
+training continues until `max_steps` is reached or the user interrupts.
 
-## 6. Pre-encode training data to disk
-Walk `training_data/` and save `<stem>_latents.npz` files so the VAE never runs during
-training iterations. Update `dataset.py` to load pre-encoded latents directly.
-Not needed until training data generation is complete.
+### 2. Call `disc.train()` (`train.py`)
+`net.train()` is called but `disc.train()` is not. Add it alongside.
+
+### 3. True sparse global attention (`model/network.py`)
+`GlobalAttention` currently computes full N×N attention (N=2730) for every token then zeros
+non-masked outputs. The design calls for only masked tokens to act as queries, attending to
+all N tokens as keys/values. This reduces the attention cost from O(N²) to O(M×N) where
+M ≈ 5–10% of N (~136–273 tokens). Implementation sketch:
+- Extract Q only from masked positions: `(B, M, D)` — requires padding since M varies per sample
+- Keep K, V from all N tokens: `(B, N, D)`
+- Run sdpa: `(B, H, M, d)` × `(B, H, N, d)ᵀ`
+- Scatter results back into the full `(B, N, D)` tensor at masked positions
+
+### 4. Pre-encode training data to disk
+The design calls for encoding all training videos to latents offline before training begins so
+the VAE never runs during the training loop. Currently the VAE runs every step.
+- Write an offline encoding script that walks `training_data/` and saves `.pt` latent files
+  alongside the existing `.npz` and `.mp4` files
+- Update the dataset to load pre-encoded latents directly instead of raw video frames
+- This frees the full GPU budget for the network during training
+
+### 5. Validation / sample logging
+No validation loop exists yet. Add:
+- Periodic decode of a fixed held-out clip to pixel space and save as a video
+- Log PSNR inside holes vs ground truth
+- Runs every N steps (e.g. every 2000 steps), separate from the training checkpoints

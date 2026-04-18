@@ -143,9 +143,12 @@ class LocalAttention(nn.Module):
 
 class GlobalAttention(nn.Module):
     """
-    Full self-attention, results applied only to masked token positions.
-    Non-masked token outputs are zeroed — the residual keeps them unchanged.
-    Fully batched via sdpa; no Python loop over batch items.
+    Sparse global attention — only masked tokens generate queries.
+    K and V come from all N tokens; Q comes only from the M masked tokens per sample.
+    Cost: O(M×N) instead of O(N²). M is typically 5-10% of N.
+
+    Q is padded to M_max across the batch for a single batched sdpa call.
+    A small Python loop (size B) handles the gather/scatter around it.
     """
 
     def __init__(self, hidden, n_heads):
@@ -164,16 +167,35 @@ class GlobalAttention(nn.Module):
         B, N, D = x.shape
         H, d = self.n_heads, self.head_dim
 
-        q, k, v = self.qkv(x).chunk(3, dim=-1)
-        q = q.reshape(B, N, H, d).permute(0, 2, 1, 3)   # (B, H, N, d)
+        q, k, v = self.qkv(x).chunk(3, dim=-1)   # each (B, N, D)
+
+        m_counts = mask_flat.sum(dim=1)           # (B,) masked tokens per sample
+        M = int(m_counts.max().item())
+
+        if M == 0:
+            return torch.zeros_like(x)
+
+        # Gather masked Q into (B, M, D), zero-padded where M_b < M
+        q_sparse = q.new_zeros(B, M, D)
+        for b in range(B):
+            mb = int(m_counts[b].item())
+            q_sparse[b, :mb] = q[b, mask_flat[b]]
+
+        # Batched attention: Q(B,H,M,d) × K(B,H,N,d)ᵀ → out(B,H,M,d)
+        q_sparse = q_sparse.reshape(B, M, H, d).permute(0, 2, 1, 3)
         k = k.reshape(B, N, H, d).permute(0, 2, 1, 3)
         v = v.reshape(B, N, H, d).permute(0, 2, 1, 3)
 
-        out = F.scaled_dot_product_attention(q, k, v)    # (B, H, N, d)
-        out = self.out_proj(out.permute(0, 2, 1, 3).reshape(B, N, D))
+        out = F.scaled_dot_product_attention(q_sparse, k, v)   # (B, H, M, d)
+        out = self.out_proj(out.permute(0, 2, 1, 3).reshape(B, M, D))
 
-        # Zero out non-masked positions; residual connection preserves their values
-        return out * mask_flat.unsqueeze(-1)
+        # Scatter results back to masked positions in the full token sequence
+        result = torch.zeros_like(x)
+        for b in range(B):
+            mb = int(m_counts[b].item())
+            result[b, mask_flat[b]] = out[b, :mb]
+
+        return result
 
 
 # ---------------------------------------------------------------------------
