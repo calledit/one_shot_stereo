@@ -9,6 +9,7 @@ Usage:
     output_video   — path to write the infilled result
 """
 
+import glob
 import os
 import sys
 import argparse
@@ -22,7 +23,13 @@ from taehv import TAEHV
 from data.dataset import compute_token_mask, FRAMES_PER_CLIP, OUTPUT_H, OUTPUT_W
 from model.network import OneShotStereoNet
 
-VAE_CHECKPOINT = os.path.join("taehv", "taew2_1.pth")
+VAE_CHECKPOINT  = os.path.join("taehv", "taew2_1.pth")
+CHECKPOINT_DIR  = "checkpoints"
+
+
+def latest_checkpoint():
+    paths = sorted(glob.glob(os.path.join(CHECKPOINT_DIR, "step_*.pt")))
+    return paths[-1] if paths else None
 
 
 # ---------------------------------------------------------------------------
@@ -83,11 +90,13 @@ def run_inference(masked_video_path, original_video_path, output_path,
 
     print("Loading network ...")
     net = OneShotStereoNet().to(device, torch.bfloat16)
-    if checkpoint_path is not None:
-        net.load_state_dict(torch.load(checkpoint_path, map_location=device))
-        print(f"  weights loaded from {checkpoint_path}")
+    resolved = checkpoint_path or latest_checkpoint()
+    if resolved is not None:
+        ckpt = torch.load(resolved, map_location=device, weights_only=True)
+        net.load_state_dict(ckpt["model"])
+        print(f"  weights loaded from {resolved} (step {ckpt.get('step', '?')})")
     else:
-        print("  no checkpoint given — running with random weights")
+        print("  no checkpoint found — running with random weights")
     net.eval()
 
     with torch.no_grad():
