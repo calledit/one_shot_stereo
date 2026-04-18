@@ -1,6 +1,6 @@
 # One Shot Stereo — Plan
 
-## 1. Attention efficiency
+## 1. ~~Attention efficiency~~
 Implemented
 The local attention `_gather_neighbors` creates large intermediate tensors `(B, N, 27, D)`.
 The global attention uses a Python loop over batch items.
@@ -10,7 +10,7 @@ Both should use `F.scaled_dot_product_attention` (PyTorch flash attention) for s
 Implemented: latent L1 outside holes every step (0.1×) plus pixel L1 outside holes
 every ~10th step via gradient-checkpointed VAE decode (1.0×).
 
-## 3. GAN loss (discriminator in latent space)
+## 3. ~~GAN loss (discriminator in latent space)~~
 Implemented
 A discriminator operating on the 2730-token latent representation. Pushes fill quality beyond
 what L1 alone achieves. Needs adversarial training loop with a separate optimizer.
