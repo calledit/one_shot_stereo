@@ -285,6 +285,9 @@ def train(
 
     net  = OneShotStereoNet().to(device, torch.bfloat16)
     disc = LatentDiscriminator().to(device, torch.bfloat16)
+    for m in list(net.modules()) + list(disc.modules()):
+        if isinstance(m, torch.nn.LayerNorm):
+            m.to(torch.float32)
     optimizer      = torch.optim.AdamW(
         net.parameters(),  lr=lr, betas=(0.9, 0.95), weight_decay=0.01,
     )

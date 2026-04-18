@@ -228,9 +228,9 @@ class SparseTransformerLayer(nn.Module):
         self.ffn         = FFN(hidden)
 
     def forward(self, x, mask_flat):
-        x = x + self.local_attn(self.norm_local(x))
-        x = x + self.global_attn(self.norm_global(x), mask_flat)
-        x = x + self.ffn(self.norm_ffn(x))
+        x = x + self.local_attn(self.norm_local(x.float()).to(x.dtype))
+        x = x + self.global_attn(self.norm_global(x.float()).to(x.dtype), mask_flat)
+        x = x + self.ffn(self.norm_ffn(x.float()).to(x.dtype))
         return x
 
 
@@ -280,5 +280,5 @@ class OneShotStereoNet(nn.Module):
         for layer in self.layers:
             x = checkpoint(layer, x, mask_flat, use_reentrant=False)
 
-        delta = self.output_proj(self.norm(x))   # (B, 2730, 256)
+        delta = self.output_proj(self.norm(x.float()).to(x.dtype))   # (B, 2730, 256)
         return unpatchify(tokens + delta)         # residual on input latents
