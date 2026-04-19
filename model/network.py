@@ -263,6 +263,13 @@ class OneShotStereoNet(nn.Module):
         nn.init.zeros_(self.output_proj.weight)
         nn.init.zeros_(self.output_proj.bias)
 
+    def to(self, *args, **kwargs):
+        super().to(*args, **kwargs)
+        for m in self.modules():
+            if isinstance(m, nn.LayerNorm):
+                m.to(torch.float32)
+        return self
+
     def forward(self, latents, token_mask):
         """
         latents    : (B, LATENT_T, LATENT_C, LATENT_H, LATENT_W)
