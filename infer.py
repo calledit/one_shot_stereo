@@ -58,10 +58,9 @@ def save_video(frames_rgb, path, fps=25.0):
     writer.release()
 
 
-def extract_green_mask(frames_rgb):
-    """Detect pure green (0,255,0) pixels as the hole mask. Returns (25, H, W) bool."""
-    g = frames_rgb.astype(np.int16)
-    return (g[..., 0] == 0) & (g[..., 1] == 255) & (g[..., 2] == 0)
+def extract_mask(mask_frames):
+    """White pixels in the mask video are holes. Returns (25, H, W) bool."""
+    return mask_frames[..., 0] > 127
 
 
 def to_ntchw(frames_hwc, device, dtype=torch.float16):
@@ -73,16 +72,21 @@ def to_ntchw(frames_hwc, device, dtype=torch.float16):
 # Inference pipeline
 # ---------------------------------------------------------------------------
 
-def run_inference(masked_video_path, original_video_path, output_path,
+def run_inference(mask_video_path, original_video_path, output_path,
                   checkpoint_path=None, device_str="cuda"):
     device = torch.device(device_str)
 
-    masked_frames   = load_video(masked_video_path)
+    mask_frames     = load_video(mask_video_path)
     original_frames = load_video(original_video_path)
 
-    hole_mask  = extract_green_mask(masked_frames)           # (25, H, W) bool
+    hole_mask  = extract_mask(mask_frames)                   # (25, H, W) bool
     token_mask = torch.from_numpy(compute_token_mask(hole_mask)).unsqueeze(0).to(device)
     # (1, 7, 15, 26)
+
+    # Paint holes green for VAE input
+    input_frames = original_frames.copy()
+    for i in range(FRAMES_PER_CLIP):
+        input_frames[i][hole_mask[i]] = [0, 255, 0]
 
     print("Loading VAE ...")
     vae = TAEHV(checkpoint_path=VAE_CHECKPOINT).to(device, torch.float16)
@@ -101,7 +105,7 @@ def run_inference(masked_video_path, original_video_path, output_path,
 
     with torch.no_grad():
         input_latents = vae.encode_video(
-            to_ntchw(masked_frames, device),
+            to_ntchw(input_frames, device),
             parallel=True, show_progress_bar=False,
         )   # (1, 7, 16, 60, 104) float16
 
@@ -131,12 +135,12 @@ def run_inference(masked_video_path, original_video_path, output_path,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="One Shot Stereo inference")
-    parser.add_argument("masked_video",   help="Input video with green-painted holes")
+    parser.add_argument("mask_video",     help="Black/white mask video (white = hole)")
     parser.add_argument("original_video", help="Clean stereo video for compositing")
     parser.add_argument("output_video",   help="Output path for infilled video")
     parser.add_argument("--checkpoint",   default=None, help="Path to trained model weights")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
-    run_inference(args.masked_video, args.original_video, args.output_video,
+    run_inference(args.mask_video, args.original_video, args.output_video,
                   args.checkpoint, args.device)

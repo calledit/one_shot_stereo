@@ -71,16 +71,16 @@ def main():
 
     gt, hole_mask = load_clip(args.npz, args.window)
 
-    masked = gt.copy()
+    mask_vis = np.zeros((FRAMES_PER_CLIP, OUTPUT_H, OUTPUT_W, 3), dtype=np.uint8)
     for i in range(FRAMES_PER_CLIP):
-        masked[i][hole_mask[i]] = [0, 255, 0]
+        mask_vis[i][hole_mask[i]] = [255, 255, 255]
 
     stem = args.npz[:-4]
-    masked_path   = stem + "_masked.mp4"
+    masked_path   = stem + "_mask.mp4"
     original_path = stem + "_original.mp4"
 
-    write_video(masked,  masked_path)
-    write_video(gt,      original_path)
+    write_video(mask_vis, masked_path)
+    write_video(gt,       original_path)
 
     print(f"Wrote {masked_path}")
     print(f"Wrote {original_path}")
