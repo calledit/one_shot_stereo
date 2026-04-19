@@ -68,7 +68,7 @@ LAMBDA_PIXEL_OUT  = 1.0   # pixel L1 outside holes
 PIXEL_LOSS_PROB   = 0.05   # probability of computing pixel loss each step
 
 # Loss weights — dynamic (shift from L1 toward GAN as training progresses)
-GAN_START_STEP        = 10_000
+GAN_START_STEP        = 28_000
 GAN_RAMP_STEPS        = 20_000
 LAMBDA_LATENT_IN_INIT = 1.0   # λ_latent_in at start and before GAN kicks in
 LAMBDA_LATENT_IN_MIN  = 0.3   # λ_latent_in after full GAN ramp
@@ -122,6 +122,17 @@ def _lr_lambda(step):
 
 def make_scheduler(optimizer):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
+
+
+def make_disc_scheduler(optimizer):
+    """Separate scheduler for the discriminator — counts from 0 at GAN_START_STEP."""
+    disc_warmup = 500
+    def _disc_lr_lambda(step):
+        if step < disc_warmup:
+            return (step + 1) / disc_warmup
+        t = min(1.0, (step - disc_warmup) / LR_DECAY_STEPS)
+        return LR_MIN_RATIO + (1 - LR_MIN_RATIO) * 0.5 * (1 + math.cos(math.pi * t))
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, _disc_lr_lambda)
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +260,7 @@ def train(
     pixel_batch_size=2,
     num_workers=2,
     lr=1e-4,
+    disc_lr=5e-4,
     device_str="cuda",
     resume=None,          # path to checkpoint; None = auto-resume from latest
     max_steps=None,
@@ -289,10 +301,10 @@ def train(
         net.parameters(),  lr=lr, betas=(0.9, 0.95), weight_decay=0.01,
     )
     disc_optimizer = torch.optim.AdamW(
-        disc.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=0.01,
+        disc.parameters(), lr=disc_lr, betas=(0.9, 0.95), weight_decay=0.01,
     )
     scheduler      = make_scheduler(optimizer)
-    disc_scheduler = make_scheduler(disc_optimizer)
+    disc_scheduler = make_disc_scheduler(disc_optimizer)
     print(f"Network parameters:       {sum(p.numel() for p in net.parameters())/1e6:.1f}M")
     print(f"Discriminator parameters: {sum(p.numel() for p in disc.parameters())/1e6:.1f}M")
 
@@ -449,5 +461,6 @@ if __name__ == "__main__":
         pixel_batch_size=2,
         num_workers=2,
         lr=1e-4,
+        disc_lr=5e-4,
         device_str="cuda" if torch.cuda.is_available() else "cpu",
     )
