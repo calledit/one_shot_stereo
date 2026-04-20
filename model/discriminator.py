@@ -2,7 +2,7 @@
 Latent-space transformer discriminator for the GAN loss.
 
 Architecture:
-  6 layers, 512 hidden, 8 heads, sparse attention:
+  4 layers, 512 hidden, 8 heads, sparse attention:
     - Local 3×3×3 attention on all tokens (non-masked tokens summarise neighbourhood)
     - Global attention on masked tokens only (pulls context from full sequence)
   Average score over masked tokens → single real/fake value per sample.
@@ -22,7 +22,7 @@ from model.network import Pos3D
 
 DISC_HIDDEN  = 512
 DISC_HEADS   = 8
-DISC_LAYERS  = 6
+DISC_LAYERS  = 4
 LOCAL_K      = 3
 CONV_CHANNELS = [64, 128, DISC_HIDDEN]   # per-token conv feature extractor
 
@@ -162,9 +162,10 @@ class TokenConvExtractor(nn.Module):
         # tokens: (B, N, TOKEN_DIM)
         B, N, _ = tokens.shape
         x = tokens.reshape(B * N, LATENT_C, PATCH_SIZE, PATCH_SIZE)
-        x = self.conv(x)                        # (B*N, DISC_HIDDEN, 4, 4)
-        x = x.mean(dim=(-2, -1))                # global avg pool → (B*N, DISC_HIDDEN)
-        return x.reshape(B, N, DISC_HIDDEN)
+        x = self.conv(x)                                    # (B*N, DISC_HIDDEN, H, W)
+        mean = x.mean(dim=(-2, -1))                         # (B*N, DISC_HIDDEN)
+        std  = x.std(dim=(-2, -1), unbiased=False)          # (B*N, DISC_HIDDEN)
+        return torch.cat([mean, std], dim=-1).reshape(B, N, DISC_HIDDEN * 2)
 
 
 # ---------------------------------------------------------------------------
@@ -172,49 +173,21 @@ class TokenConvExtractor(nn.Module):
 # ---------------------------------------------------------------------------
 
 class ScoreFunnel(nn.Module):
-    """
-    A single learnable query attends to all masked token features and produces
-    one score per sample. Lets the network focus on the most suspicious tokens
-    rather than averaging all of them equally.
-    """
+    """Mean-pool masked tokens → 2-layer MLP score."""
 
     def __init__(self, hidden, n_heads):
         super().__init__()
-        self.n_heads  = n_heads
-        self.head_dim = hidden // n_heads
-        self.query    = nn.Parameter(torch.zeros(1, 1, hidden))
-        self.kv_proj  = nn.Linear(hidden, 2 * hidden, bias=False)
-        self.out_proj = nn.Linear(hidden, hidden, bias=False)
-        self.norm     = nn.LayerNorm(hidden)
-        self.score    = nn.Linear(hidden, 1)
+        self.norm  = nn.LayerNorm(hidden)
+        self.mlp   = nn.Sequential(
+            nn.Linear(hidden, hidden // 2),
+            nn.GELU(),
+            nn.Linear(hidden // 2, 1),
+        )
 
     def forward(self, x, mask_flat):
-        B, N, D = x.shape
-        H, d = self.n_heads, self.head_dim
-        m_counts = mask_flat.sum(dim=1)
-        M = int(m_counts.max().item())
-
-        # Pack masked tokens per sample into (B, M, D), padding the rest
-        kv          = x.new_zeros(B, M, D)
-        key_padding = torch.zeros(B, M, dtype=torch.bool, device=x.device)
-        for b in range(B):
-            mb = int(m_counts[b].item())
-            kv[b, :mb]          = x[b, mask_flat[b]]
-            key_padding[b, mb:] = True   # padding positions
-
-        k, v = self.kv_proj(kv).chunk(2, dim=-1)
-        q    = self.query.expand(B, 1, D)
-
-        q = q.reshape(B, 1, H, d).permute(0, 2, 1, 3)
-        k = k.reshape(B, M, H, d).permute(0, 2, 1, 3)
-        v = v.reshape(B, M, H, d).permute(0, 2, 1, 3)
-
-        # attn_mask: True = attend, False = skip padding
-        attn_mask = ~key_padding.unsqueeze(1).unsqueeze(2)   # (B, 1, 1, M)
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
-
-        out = self.out_proj(out.permute(0, 2, 1, 3).reshape(B, D))   # (B, D)
-        return self.score(self.norm(out.float()).to(out.dtype)).squeeze(-1)  # (B,)
+        counts = mask_flat.sum(dim=1, keepdim=True).clamp(min=1).unsqueeze(-1)  # (B,1,1)
+        pooled = (x * mask_flat.unsqueeze(-1)).sum(dim=1) / counts.squeeze(1)   # (B, D)
+        return self.mlp(self.norm(pooled.float()).to(x.dtype)).squeeze(-1)       # (B,)
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +204,7 @@ class LatentDiscriminator(nn.Module):
     def __init__(self):
         super().__init__()
         self.input_proj = TokenConvExtractor()
+        self.proj_down  = nn.Linear(DISC_HIDDEN * 2, DISC_HIDDEN, bias=False)
         self.pos_enc    = Pos3D(DISC_HIDDEN)
         self.layers     = nn.ModuleList([
             DiscTransformerLayer(DISC_HIDDEN, DISC_HEADS) for _ in range(DISC_LAYERS)
@@ -261,7 +235,7 @@ class LatentDiscriminator(nn.Module):
         mask_flat : (B, N) bool
         Returns   : (B,) scores — one per sample
         """
-        x = self.input_proj(tokens) + self.pos_enc().to(dtype=tokens.dtype, device=tokens.device)
+        x = self.proj_down(self.input_proj(tokens)) + self.pos_enc().to(dtype=tokens.dtype, device=tokens.device)
         for layer in self.layers:
             x = layer(x, mask_flat)
         return self.funnel(x, mask_flat)   # (B,)

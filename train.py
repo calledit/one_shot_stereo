@@ -68,7 +68,7 @@ LAMBDA_PIXEL_OUT  = 1.0   # pixel L1 outside holes
 PIXEL_LOSS_PROB   = 0.05   # probability of computing pixel loss each step
 
 # Loss weights — dynamic (shift from L1 toward GAN as training progresses)
-GAN_START_STEP        = 47_000
+GAN_START_STEP        = 51_000
 GAN_RAMP_STEPS        = 20_000
 LAMBDA_LATENT_IN_INIT = 1.0   # λ_latent_in at start and before GAN kicks in
 LAMBDA_LATENT_IN_MIN  = 0.3   # λ_latent_in after full GAN ramp
@@ -314,7 +314,7 @@ def train(
         net.parameters(),  lr=lr, betas=(0.9, 0.95), weight_decay=0.01,
     )
     disc_optimizer = torch.optim.AdamW(
-        disc.parameters(), lr=disc_lr, betas=(0.9, 0.95), weight_decay=0.01,
+        disc.parameters(), lr=disc_lr, betas=(0.0, 0.9), weight_decay=0.01,
     )
     scheduler      = make_scheduler(optimizer)
     disc_scheduler = make_disc_scheduler(disc_optimizer)
@@ -334,9 +334,10 @@ def train(
     net.train()
     disc.train()
 
-    disc_gap_ema   = 0.0   # EMA of (real_mean - fake_mean); unlocks G when > DISC_UNLOCK_THRESHOLD
-    gan_g_unlocked = False
-    gan_g_unlock_step = None
+    if ckpt is None:
+        disc_gap_ema      = 0.0
+        gan_g_unlocked    = False
+        gan_g_unlock_step = None
 
     # Memory baseline: models loaded, before any batch work
     if device.type == "cuda":
@@ -399,30 +400,6 @@ def train(
 
         lam_in, lam_gan = get_loss_weights(step, gan_g_unlock_step)
 
-        # --- Discriminator update (only after GAN_START_STEP) ---
-        d_loss_val = None
-        d_real_mean = None
-        d_fake_mean = None
-        if step >= GAN_START_STEP:
-            for _d_step in range(N_DISC_STEPS):
-                real_scores = disc(gt_tokens,   mask_flat)
-                fake_scores = disc(pred_tokens, mask_flat)
-                d_loss = d_hinge(real_scores, fake_scores)
-                disc_optimizer.zero_grad()
-                d_loss.backward()
-                torch.nn.utils.clip_grad_norm_(disc.parameters(), GRAD_CLIP_NORM)
-                disc_optimizer.step()
-                disc_scheduler.step()
-            _mem_snapshot("after D backward", mem, device)
-            d_loss_val  = d_loss.item()
-            d_real_mean = real_scores.mean().item()
-            d_fake_mean = fake_scores.mean().item()
-            disc_gap_ema = (1 - DISC_UNLOCK_EMA_ALPHA) * disc_gap_ema + DISC_UNLOCK_EMA_ALPHA * (d_real_mean - d_fake_mean)
-            if not gan_g_unlocked and disc_gap_ema >= DISC_UNLOCK_THRESHOLD:
-                gan_g_unlocked    = True
-                gan_g_unlock_step = step
-                print(f"  [GAN] D gap EMA={disc_gap_ema:.3f} >= {DISC_UNLOCK_THRESHOLD} — unlocking G adversarial loss at step {step}")
-
         # --- Generator update ---
         pred_tokens_g = patchify(pred_latents)   # not detached — gradients flow to net
 
@@ -433,8 +410,6 @@ def train(
         g_loss_val = None
         if gan_g_unlocked:
             # Detach unmasked positions so G gradient only flows through the infill region.
-            # The discriminator still sees all tokens for attention context, but the
-            # outside-mask reconstruction is not corrupted by the adversarial signal.
             mask_g = mask_flat.unsqueeze(-1).expand_as(pred_tokens_g)
             pred_tokens_g_in = torch.where(mask_g, pred_tokens_g, pred_tokens_g.detach())
             g_loss = lam_gan * g_hinge(disc(pred_tokens_g_in, mask_flat))
@@ -449,6 +424,30 @@ def train(
         torch.nn.utils.clip_grad_norm_(net.parameters(), GRAD_CLIP_NORM)
         optimizer.step()
         scheduler.step()
+
+        # --- Discriminator update (only after GAN_START_STEP) ---
+        # Runs after G update so D scores the current batch before being trained on it.
+        d_loss_val = None
+        d_real_mean = None
+        d_fake_mean = None
+        if step >= GAN_START_STEP:
+            real_scores = disc(gt_tokens,   mask_flat)
+            fake_scores = disc(pred_tokens, mask_flat)
+            d_loss = d_hinge(real_scores, fake_scores)
+            disc_optimizer.zero_grad()
+            d_loss.backward()
+            torch.nn.utils.clip_grad_norm_(disc.parameters(), GRAD_CLIP_NORM)
+            disc_optimizer.step()
+            disc_scheduler.step()
+            _mem_snapshot("after D backward", mem, device)
+            d_loss_val  = d_loss.item()
+            d_real_mean = real_scores.mean().item()
+            d_fake_mean = fake_scores.mean().item()
+            disc_gap_ema = (1 - DISC_UNLOCK_EMA_ALPHA) * disc_gap_ema + DISC_UNLOCK_EMA_ALPHA * (d_real_mean - d_fake_mean)
+            if not gan_g_unlocked and step >= GAN_START_STEP + 1000 and disc_gap_ema >= DISC_UNLOCK_THRESHOLD:
+                gan_g_unlocked    = True
+                gan_g_unlock_step = step
+                print(f"  [GAN] D gap EMA={disc_gap_ema:.3f} >= {DISC_UNLOCK_THRESHOLD} — unlocking G adversarial loss at step {step}")
 
         step += 1
         current_lr = scheduler.get_last_lr()[0]
