@@ -30,6 +30,10 @@ def main():
     args = parser.parse_args()
 
     df = pd.read_csv(args.log)
+    original_len = len(df)
+    df = df.drop_duplicates(subset="step", keep="last").sort_values("step").reset_index(drop=True)
+    if len(df) < original_len:
+        print(f"Dropped {original_len - len(df)} stale rows from aborted runs")
     print(f"Loaded {len(df)} rows up to step {df['step'].max()}")
 
     fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
