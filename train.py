@@ -68,11 +68,17 @@ LAMBDA_PIXEL_OUT  = 1.0   # pixel L1 outside holes
 PIXEL_LOSS_PROB   = 0.05   # probability of computing pixel loss each step
 
 # Loss weights — dynamic (shift from L1 toward GAN as training progresses)
-GAN_START_STEP        = 28_000
+GAN_START_STEP        = 47_000
 GAN_RAMP_STEPS        = 20_000
 LAMBDA_LATENT_IN_INIT = 1.0   # λ_latent_in at start and before GAN kicks in
 LAMBDA_LATENT_IN_MIN  = 0.3   # λ_latent_in after full GAN ramp
 LAMBDA_GAN_MAX        = 0.5   # λ_gan after full ramp
+N_DISC_STEPS          = 1     # D updates per G step during GAN training
+
+# D readiness: G adversarial loss unlocks once the EMA of (real - fake) score gap
+# exceeds this threshold, meaning D can reliably distinguish real from fake.
+DISC_UNLOCK_THRESHOLD = 0.3
+DISC_UNLOCK_EMA_ALPHA = 0.02  # smoothing — ~50 step window
 
 
 # ---------------------------------------------------------------------------
@@ -99,11 +105,11 @@ def encode(vae, batch_ntchw, device):
 # Loss scheduling
 # ---------------------------------------------------------------------------
 
-def get_loss_weights(step):
+def get_loss_weights(step, gan_g_unlock_step=None):
     """Return (lambda_latent_in, lambda_gan) for the current step."""
-    if step < GAN_START_STEP:
+    if gan_g_unlock_step is None:
         return LAMBDA_LATENT_IN_INIT, 0.0
-    t = min(1.0, (step - GAN_START_STEP) / GAN_RAMP_STEPS)
+    t = min(1.0, (step - gan_g_unlock_step) / GAN_RAMP_STEPS)
     lam_in  = LAMBDA_LATENT_IN_INIT + t * (LAMBDA_LATENT_IN_MIN - LAMBDA_LATENT_IN_INIT)
     lam_gan = t * LAMBDA_GAN_MAX
     return lam_in, lam_gan
@@ -126,7 +132,7 @@ def make_scheduler(optimizer):
 
 def make_disc_scheduler(optimizer):
     """Separate scheduler for the discriminator — counts from 0 at GAN_START_STEP."""
-    disc_warmup = 500
+    disc_warmup = 1
     def _disc_lr_lambda(step):
         if step < disc_warmup:
             return (step + 1) / disc_warmup
@@ -207,17 +213,21 @@ def checkpoint_path(step):
     return os.path.join(CHECKPOINT_DIR, f"step_{step:07d}.pt")
 
 
-def save_checkpoint(net, optimizer, scheduler, disc, disc_optimizer, disc_scheduler, step):
+def save_checkpoint(net, optimizer, scheduler, disc, disc_optimizer, disc_scheduler, step,
+                    disc_gap_ema, gan_g_unlocked, gan_g_unlock_step):
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     path = checkpoint_path(step)
     torch.save({
-        "step":           step,
-        "model":          net.state_dict(),
-        "optimizer":      optimizer.state_dict(),
-        "scheduler":      scheduler.state_dict(),
-        "disc":           disc.state_dict(),
-        "disc_optimizer": disc_optimizer.state_dict(),
-        "disc_scheduler": disc_scheduler.state_dict(),
+        "step":              step,
+        "model":             net.state_dict(),
+        "optimizer":         optimizer.state_dict(),
+        "scheduler":         scheduler.state_dict(),
+        "disc":              disc.state_dict(),
+        "disc_optimizer":    disc_optimizer.state_dict(),
+        "disc_scheduler":    disc_scheduler.state_dict(),
+        "disc_gap_ema":      disc_gap_ema,
+        "gan_g_unlocked":    gan_g_unlocked,
+        "gan_g_unlock_step": gan_g_unlock_step,
     }, path)
     print(f"  saved {path}")
     _prune_checkpoints()
@@ -228,10 +238,13 @@ def load_checkpoint(path, net, optimizer, scheduler, disc, disc_optimizer, disc_
     net.load_state_dict(state["model"])
     optimizer.load_state_dict(state["optimizer"])
     scheduler.load_state_dict(state["scheduler"])
-    disc.load_state_dict(state["disc"])
-    disc_optimizer.load_state_dict(state["disc_optimizer"])
-    disc_scheduler.load_state_dict(state["disc_scheduler"])
-    return state["step"]
+    #disc.load_state_dict(state["disc"])
+    #disc_optimizer.load_state_dict(state["disc_optimizer"])
+    #disc_scheduler.load_state_dict(state["disc_scheduler"])
+    disc_gap_ema      = state.get("disc_gap_ema",      0.0)
+    gan_g_unlocked    = state.get("gan_g_unlocked",    False)
+    gan_g_unlock_step = state.get("gan_g_unlock_step", None)
+    return state["step"], disc_gap_ema, gan_g_unlocked, gan_g_unlock_step
 
 
 def latest_checkpoint():
@@ -312,14 +325,18 @@ def train(
     step = 0
     ckpt = resume if resume is not None else latest_checkpoint()
     if ckpt is not None:
-        step = load_checkpoint(
+        step, disc_gap_ema, gan_g_unlocked, gan_g_unlock_step = load_checkpoint(
             ckpt, net, optimizer, scheduler, disc, disc_optimizer, disc_scheduler, device)
-        print(f"Resumed from {ckpt}  (step {step})")
+        print(f"Resumed from {ckpt}  (step {step}, D gap EMA {disc_gap_ema:.3f}, G unlocked={gan_g_unlocked})")
     else:
         print("Starting from scratch")
 
     net.train()
     disc.train()
+
+    disc_gap_ema   = 0.0   # EMA of (real_mean - fake_mean); unlocks G when > DISC_UNLOCK_THRESHOLD
+    gan_g_unlocked = False
+    gan_g_unlock_step = None
 
     # Memory baseline: models loaded, before any batch work
     if device.type == "cuda":
@@ -380,21 +397,31 @@ def train(
         pred_tokens = patchify(pred_latents).detach()   # detached for D update
         gt_tokens   = patchify(gt_bf16)
 
-        lam_in, lam_gan = get_loss_weights(step)
+        lam_in, lam_gan = get_loss_weights(step, gan_g_unlock_step)
 
         # --- Discriminator update (only after GAN_START_STEP) ---
         d_loss_val = None
+        d_real_mean = None
+        d_fake_mean = None
         if step >= GAN_START_STEP:
-            real_scores = disc(gt_tokens,   mask_flat)
-            fake_scores = disc(pred_tokens, mask_flat)
-            d_loss = d_hinge(real_scores, fake_scores)
-            disc_optimizer.zero_grad()
-            d_loss.backward()
+            for _d_step in range(N_DISC_STEPS):
+                real_scores = disc(gt_tokens,   mask_flat)
+                fake_scores = disc(pred_tokens, mask_flat)
+                d_loss = d_hinge(real_scores, fake_scores)
+                disc_optimizer.zero_grad()
+                d_loss.backward()
+                torch.nn.utils.clip_grad_norm_(disc.parameters(), GRAD_CLIP_NORM)
+                disc_optimizer.step()
+                disc_scheduler.step()
             _mem_snapshot("after D backward", mem, device)
-            torch.nn.utils.clip_grad_norm_(disc.parameters(), GRAD_CLIP_NORM)
-            disc_optimizer.step()
-            disc_scheduler.step()
-            d_loss_val = d_loss.item()
+            d_loss_val  = d_loss.item()
+            d_real_mean = real_scores.mean().item()
+            d_fake_mean = fake_scores.mean().item()
+            disc_gap_ema = (1 - DISC_UNLOCK_EMA_ALPHA) * disc_gap_ema + DISC_UNLOCK_EMA_ALPHA * (d_real_mean - d_fake_mean)
+            if not gan_g_unlocked and disc_gap_ema >= DISC_UNLOCK_THRESHOLD:
+                gan_g_unlocked    = True
+                gan_g_unlock_step = step
+                print(f"  [GAN] D gap EMA={disc_gap_ema:.3f} >= {DISC_UNLOCK_THRESHOLD} — unlocking G adversarial loss at step {step}")
 
         # --- Generator update ---
         pred_tokens_g = patchify(pred_latents)   # not detached — gradients flow to net
@@ -404,12 +431,19 @@ def train(
         loss     = loss_in + loss_out
 
         g_loss_val = None
-        if step >= GAN_START_STEP:
-            g_loss = lam_gan * g_hinge(disc(pred_tokens_g, mask_flat))
+        if gan_g_unlocked:
+            # Detach unmasked positions so G gradient only flows through the infill region.
+            # The discriminator still sees all tokens for attention context, but the
+            # outside-mask reconstruction is not corrupted by the adversarial signal.
+            mask_g = mask_flat.unsqueeze(-1).expand_as(pred_tokens_g)
+            pred_tokens_g_in = torch.where(mask_g, pred_tokens_g, pred_tokens_g.detach())
+            g_loss = lam_gan * g_hinge(disc(pred_tokens_g_in, mask_flat))
             loss = loss + g_loss
             g_loss_val = g_loss.item()
 
         optimizer.zero_grad()
+        if gan_g_unlocked:
+            disc_optimizer.zero_grad()  # prevent D grad accumulation from G backward
         loss.backward()
         _mem_snapshot("after G backward", mem, device)
         torch.nn.utils.clip_grad_norm_(net.parameters(), GRAD_CLIP_NORM)
@@ -439,8 +473,12 @@ def train(
             print()
 
         pix_str = f" pix {pix_loss_val:.4f}" if pix_loss_val is not None else ""
-        gan_str = (f" | D {d_loss_val:.4f} G {g_loss_val:.4f}"
-                   if g_loss_val is not None else "")
+        if d_loss_val is not None:
+            g_str    = f" G {g_loss_val:.4f}" if g_loss_val is not None else " G --"
+            lock_str = f" gap {disc_gap_ema:.3f}/{DISC_UNLOCK_THRESHOLD}" if not gan_g_unlocked else ""
+            gan_str  = f" | D {d_loss_val:.4f}{g_str} real {d_real_mean:+.3f} fake {d_fake_mean:+.3f}{lock_str}"
+        else:
+            gan_str = ""
         print(f"step {step:6d} | loss {loss.item():.4f} "
               f"(in {loss_in.item():.4f} out {loss_out.item():.4f}{pix_str}){gan_str} | "
               f"lr {current_lr:.2e} lam_in {lam_in:.2f} lam_gan {lam_gan:.2f} | "
@@ -448,10 +486,12 @@ def train(
               f"VRAM peak {peak_mb:.0f} MB")
 
         if step % SAVE_EVERY == 0:
-            save_checkpoint(net, optimizer, scheduler, disc, disc_optimizer, disc_scheduler, step)
+            save_checkpoint(net, optimizer, scheduler, disc, disc_optimizer, disc_scheduler, step,
+                            disc_gap_ema, gan_g_unlocked, gan_g_unlock_step)
 
     # Always save at end of run
-    save_checkpoint(net, optimizer, scheduler, disc, disc_optimizer, disc_scheduler, step)
+    save_checkpoint(net, optimizer, scheduler, disc, disc_optimizer, disc_scheduler, step,
+                    disc_gap_ema, gan_g_unlocked, gan_g_unlock_step)
     print("Done.")
 
 
