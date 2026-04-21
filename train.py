@@ -314,7 +314,7 @@ def train(
         net.parameters(),  lr=lr, betas=(0.9, 0.95), weight_decay=0.01,
     )
     disc_optimizer = torch.optim.AdamW(
-        disc.parameters(), lr=disc_lr, betas=(0.0, 0.9), weight_decay=0.01,
+        disc.parameters(), lr=disc_lr, betas=(0.5, 0.9), weight_decay=0.01,
     )
     scheduler      = make_scheduler(optimizer)
     disc_scheduler = make_disc_scheduler(disc_optimizer)

@@ -27,6 +27,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--log",    default=os.path.join(ROOT, "training_log.csv"))
     parser.add_argument("--smooth", type=int, default=50, help="Smoothing window (steps)")
+    parser.add_argument("--start",  type=int, default=0,  help="Ignore steps before this value")
     args = parser.parse_args()
 
     df = pd.read_csv(args.log)
@@ -34,6 +35,9 @@ def main():
     df = df.drop_duplicates(subset="step", keep="last").sort_values("step").reset_index(drop=True)
     if len(df) < original_len:
         print(f"Dropped {original_len - len(df)} stale rows from aborted runs")
+    if args.start > 0:
+        df = df[df["step"] >= args.start].reset_index(drop=True)
+        print(f"Showing steps {args.start}+ ({len(df)} rows)")
     print(f"Loaded {len(df)} rows up to step {df['step'].max()}")
 
     fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
