@@ -6,8 +6,8 @@ Forward pass:
   token_mask (B, T, TH, TW)   True where a 4×4 latent patch contains a hole
 
   → patchify 4×4 → (B, 2730, 256) + append flag → (B, 2730, 257)
-  → linear projection + 3D positional encoding → (B, 2730, 1024)
-  → 10× SparseTransformerLayer
+  → 2-layer MLP projection + 3D positional encoding → (B, 2730, 1024)
+  → 12× SparseTransformerLayer
       local  attention (3×3×3 window, all tokens)
       global attention (full sequence, masked tokens only)
       FFN
@@ -30,7 +30,7 @@ TOKEN_IN  = TOKEN_DIM + 1                  # 257  (256 patch values + 1 mask fla
 HIDDEN    = 1024
 N_HEADS   = 16
 HEAD_DIM  = HIDDEN // N_HEADS              # 64
-N_LAYERS  = 10
+N_LAYERS  = 12
 LOCAL_K   = 3                              # 3×3×3 local window → 27 neighbors
 
 
@@ -241,13 +241,24 @@ class SparseTransformerLayer(nn.Module):
 class OneShotStereoNet(nn.Module):
     def __init__(self):
         super().__init__()
-        self.input_proj  = nn.Linear(TOKEN_IN, HIDDEN)
+        self.input_proj  = nn.Sequential(
+            nn.Linear(TOKEN_IN, HIDDEN * 3 // 8),
+            nn.GELU(),
+            nn.Linear(HIDDEN * 3 // 8, HIDDEN * 3 // 4),
+            nn.GELU(),
+            nn.Linear(HIDDEN * 3 // 4, HIDDEN),
+        )
+        self.input_norm  = nn.LayerNorm(HIDDEN)
         self.pos_enc     = Pos3D(HIDDEN)
         self.layers      = nn.ModuleList([
             SparseTransformerLayer(HIDDEN, N_HEADS) for _ in range(N_LAYERS)
         ])
         self.norm        = nn.LayerNorm(HIDDEN)
-        self.output_proj = nn.Linear(HIDDEN, TOKEN_DIM)
+        self.output_proj = nn.Sequential(
+            nn.Linear(HIDDEN, HIDDEN // 2),
+            nn.GELU(),
+            nn.Linear(HIDDEN // 2, TOKEN_DIM),
+        )
         self._init_weights()
 
     def _init_weights(self):
@@ -260,8 +271,8 @@ class OneShotStereoNet(nn.Module):
                     nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Embedding):
                 nn.init.trunc_normal_(m.weight, std=0.02, a=-0.04, b=0.04)
-        nn.init.zeros_(self.output_proj.weight)
-        nn.init.zeros_(self.output_proj.bias)
+        nn.init.zeros_(self.output_proj[-1].weight)
+        nn.init.zeros_(self.output_proj[-1].bias)
 
     def to(self, *args, **kwargs):
         super().to(*args, **kwargs)
@@ -282,6 +293,7 @@ class OneShotStereoNet(nn.Module):
         tokens = patchify(latents)                                          # (B, 2730, 256)
         flag   = mask_flat.unsqueeze(-1).to(tokens.dtype)
         x      = self.input_proj(torch.cat([tokens, flag], dim=-1))        # (B, 2730, 1024)
+        x      = self.input_norm(x.float()).to(x.dtype)
         x      = x + self.pos_enc().to(dtype=x.dtype, device=x.device)
 
         for layer in self.layers:

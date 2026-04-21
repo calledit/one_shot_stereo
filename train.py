@@ -3,6 +3,7 @@ import os
 import sys
 import glob
 import random
+import shutil
 import torch
 from torch.utils.checkpoint import checkpoint as grad_ckpt
 from torch.utils.data import DataLoader
@@ -50,10 +51,12 @@ from model.network import OneShotStereoNet, patchify
 from model.discriminator import LatentDiscriminator, d_hinge, g_hinge
 
 VAE_CHECKPOINT  = os.path.join("taehv", "taew2_1.pth")
-CHECKPOINT_DIR  = "checkpoints"
-LOG_FILE        = "training_log.csv"
-SAVE_EVERY      = 500     # steps between auto-saves
-KEEP_LAST       = 5       # number of recent checkpoints to keep on disk
+CHECKPOINT_DIR      = "checkpoints"
+CHECKPOINT_LONG_DIR = "checkpoints_long"
+LOG_FILE            = "training_log.csv"
+SAVE_EVERY          = 500     # steps between auto-saves
+KEEP_LAST           = 5       # number of recent checkpoints to keep on disk
+SAVE_LONG_EVERY     = 10_000  # steps between long-term checkpoint copies (never pruned)
 
 # LR schedule
 WARMUP_STEPS    = 1_000
@@ -68,7 +71,7 @@ LAMBDA_PIXEL_OUT  = 1.0   # pixel L1 outside holes
 PIXEL_LOSS_PROB   = 0.05   # probability of computing pixel loss each step
 
 # Loss weights — dynamic (shift from L1 toward GAN as training progresses)
-GAN_START_STEP        = 51_000
+GAN_START_STEP        = 2_000
 GAN_RAMP_STEPS        = 20_000
 LAMBDA_LATENT_IN_INIT = 1.0   # λ_latent_in at start and before GAN kicks in
 LAMBDA_LATENT_IN_MIN  = 0.3   # λ_latent_in after full GAN ramp
@@ -79,6 +82,15 @@ N_DISC_STEPS          = 1     # D updates per G step during GAN training
 # exceeds this threshold, meaning D can reliably distinguish real from fake.
 DISC_UNLOCK_THRESHOLD = 0.3
 DISC_UNLOCK_EMA_ALPHA = 0.02  # smoothing — ~50 step window
+DISC_UNLOCK_START     = 1000
+
+# Adaptive D LR controller (ADA-style): nudge disc_lr_scale each step to keep
+# disc_gap_ema near the target. Slow fractional adjustments, clamped to safe range.
+DISC_TARGET_GAP       = 0.6   # desired disc_gap_ema during GAN training
+DISC_LR_ADJUST_RATE   = 0.002 # fractional LR change per step
+DISC_LR_SCALE_MIN     = 0.01
+DISC_LR_SCALE_MAX     = 5.0
+GEN_LR_SCALE_MIN      = 0.01  # floor when G LR is scaled down to help D catch up
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +226,7 @@ def checkpoint_path(step):
 
 
 def save_checkpoint(net, optimizer, scheduler, disc, disc_optimizer, disc_scheduler, step,
-                    disc_gap_ema, gan_g_unlocked, gan_g_unlock_step):
+                    disc_gap_ema, gan_g_unlocked, gan_g_unlock_step, disc_lr_scale, gen_lr_scale):
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     path = checkpoint_path(step)
     torch.save({
@@ -228,6 +240,8 @@ def save_checkpoint(net, optimizer, scheduler, disc, disc_optimizer, disc_schedu
         "disc_gap_ema":      disc_gap_ema,
         "gan_g_unlocked":    gan_g_unlocked,
         "gan_g_unlock_step": gan_g_unlock_step,
+        "disc_lr_scale":     disc_lr_scale,
+        "gen_lr_scale":      gen_lr_scale,
     }, path)
     print(f"  saved {path}")
     _prune_checkpoints()
@@ -244,7 +258,9 @@ def load_checkpoint(path, net, optimizer, scheduler, disc, disc_optimizer, disc_
     disc_gap_ema      = state.get("disc_gap_ema",      0.0)
     gan_g_unlocked    = state.get("gan_g_unlocked",    False)
     gan_g_unlock_step = state.get("gan_g_unlock_step", None)
-    return state["step"], disc_gap_ema, gan_g_unlocked, gan_g_unlock_step
+    disc_lr_scale     = state.get("disc_lr_scale",     1.0)
+    gen_lr_scale      = state.get("gen_lr_scale",      1.0)
+    return state["step"], disc_gap_ema, gan_g_unlocked, gan_g_unlock_step, disc_lr_scale, gen_lr_scale
 
 
 def latest_checkpoint():
@@ -325,9 +341,9 @@ def train(
     step = 0
     ckpt = resume if resume is not None else latest_checkpoint()
     if ckpt is not None:
-        step, disc_gap_ema, gan_g_unlocked, gan_g_unlock_step = load_checkpoint(
+        step, disc_gap_ema, gan_g_unlocked, gan_g_unlock_step, disc_lr_scale, gen_lr_scale = load_checkpoint(
             ckpt, net, optimizer, scheduler, disc, disc_optimizer, disc_scheduler, device)
-        print(f"Resumed from {ckpt}  (step {step}, D gap EMA {disc_gap_ema:.3f}, G unlocked={gan_g_unlocked})")
+        print(f"Resumed from {ckpt}  (step {step}, D gap EMA {disc_gap_ema:.3f}, G unlocked={gan_g_unlocked}, D lr_scale={disc_lr_scale:.3f}, G lr_scale={gen_lr_scale:.3f})")
     else:
         print("Starting from scratch")
 
@@ -338,6 +354,8 @@ def train(
         disc_gap_ema      = 0.0
         gan_g_unlocked    = False
         gan_g_unlock_step = None
+        disc_lr_scale     = 1.0
+        gen_lr_scale      = 1.0
 
     # Memory baseline: models loaded, before any batch work
     if device.type == "cuda":
@@ -444,10 +462,31 @@ def train(
             d_real_mean = real_scores.mean().item()
             d_fake_mean = fake_scores.mean().item()
             disc_gap_ema = (1 - DISC_UNLOCK_EMA_ALPHA) * disc_gap_ema + DISC_UNLOCK_EMA_ALPHA * (d_real_mean - d_fake_mean)
-            if not gan_g_unlocked and step >= GAN_START_STEP + 1000 and disc_gap_ema >= DISC_UNLOCK_THRESHOLD:
+            if not gan_g_unlocked and step >= GAN_START_STEP + DISC_UNLOCK_START and disc_gap_ema >= DISC_UNLOCK_THRESHOLD:
                 gan_g_unlocked    = True
                 gan_g_unlock_step = step
                 print(f"  [GAN] D gap EMA={disc_gap_ema:.3f} >= {DISC_UNLOCK_THRESHOLD} — unlocking G adversarial loss at step {step}")
+            # Adaptive LR controller: keep disc_gap_ema near DISC_TARGET_GAP.
+            # Primary lever: disc_lr_scale. If D needs more help and disc_lr_scale
+            # is already at MAX, spill over into slowing G down instead.
+            if disc_gap_ema > DISC_TARGET_GAP:
+                # D winning too much — slow it down; restore G LR first if reduced
+                if gen_lr_scale < 1.0:
+                    gen_lr_scale = min(1.0, gen_lr_scale * (1 + DISC_LR_ADJUST_RATE))
+                else:
+                    disc_lr_scale *= (1 - DISC_LR_ADJUST_RATE)
+            else:
+                # D needs help — speed it up; if already at MAX, slow G instead
+                if disc_lr_scale < DISC_LR_SCALE_MAX:
+                    disc_lr_scale *= (1 + DISC_LR_ADJUST_RATE)
+                else:
+                    gen_lr_scale *= (1 - DISC_LR_ADJUST_RATE)
+                    gen_lr_scale = max(GEN_LR_SCALE_MIN, gen_lr_scale)
+            disc_lr_scale = max(DISC_LR_SCALE_MIN, min(DISC_LR_SCALE_MAX, disc_lr_scale))
+            for pg in disc_optimizer.param_groups:
+                pg['lr'] = disc_scheduler.get_last_lr()[0] * disc_lr_scale
+            for pg in optimizer.param_groups:
+                pg['lr'] = scheduler.get_last_lr()[0] * gen_lr_scale
 
         step += 1
         current_lr = scheduler.get_last_lr()[0]
@@ -475,7 +514,7 @@ def train(
         if d_loss_val is not None:
             g_str    = f" G {g_loss_val:.4f}" if g_loss_val is not None else " G --"
             lock_str = f" gap {disc_gap_ema:.3f}/{DISC_UNLOCK_THRESHOLD}" if not gan_g_unlocked else ""
-            gan_str  = f" | D {d_loss_val:.4f}{g_str} real {d_real_mean:+.3f} fake {d_fake_mean:+.3f}{lock_str}"
+            gan_str  = f" | D {d_loss_val:.4f}{g_str} real {d_real_mean:+.3f} fake {d_fake_mean:+.3f}{lock_str} dlr {disc_lr_scale:.3f} glr {gen_lr_scale:.3f}"
         else:
             gan_str = ""
         print(f"step {step:6d} | loss {loss.item():.4f} "
@@ -486,11 +525,17 @@ def train(
 
         if step % SAVE_EVERY == 0:
             save_checkpoint(net, optimizer, scheduler, disc, disc_optimizer, disc_scheduler, step,
-                            disc_gap_ema, gan_g_unlocked, gan_g_unlock_step)
+                            disc_gap_ema, gan_g_unlocked, gan_g_unlock_step, disc_lr_scale, gen_lr_scale)
+        if step % SAVE_LONG_EVERY == 0:
+            os.makedirs(CHECKPOINT_LONG_DIR, exist_ok=True)
+            src = checkpoint_path(step)
+            dst = os.path.join(CHECKPOINT_LONG_DIR, f"step_{step:07d}.pt")
+            shutil.copy2(src, dst)
+            print(f"  long-term checkpoint saved {dst}")
 
     # Always save at end of run
     save_checkpoint(net, optimizer, scheduler, disc, disc_optimizer, disc_scheduler, step,
-                    disc_gap_ema, gan_g_unlocked, gan_g_unlock_step)
+                    disc_gap_ema, gan_g_unlocked, gan_g_unlock_step, disc_lr_scale, gen_lr_scale)
     print("Done.")
 
 
@@ -499,7 +544,7 @@ if __name__ == "__main__":
         batch_size=4,
         pixel_batch_size=2,
         num_workers=2,
-        lr=1e-4,
-        disc_lr=5e-4,
+        lr=2e-4,
+        disc_lr=2e-4,
         device_str="cuda" if torch.cuda.is_available() else "cpu",
     )
